@@ -352,9 +352,9 @@ This software is provided for legitimate privacy-enhancing purposes. Users are r
 
 ## Contact
 
-- **Issues**: [GitHub Issues URL]
-- **Security**: [Security contact/PGP key]
-- **Discussion**: [Forum/Matrix/IRC]
+- **Issues**: [https://www.virebent.art/contacts.html]
+- **Security**: [[Security contact/PGP key]](https://www.virebent.art/C6625F44806AC65957935BD848BF95F3ECACDDB3.asc)
+- **Discussion**: [alt.privacy.anon-server]
 
 ---
 
