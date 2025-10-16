@@ -338,7 +338,7 @@ pluto2.go
 
 ## License
 
-[Your License Here - e.g., MIT, GPL-3.0, etc.]
+[MIT]
 
 ## Disclaimer
 
