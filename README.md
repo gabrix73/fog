@@ -1,3 +1,6 @@
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go Version](https://img.shields.io/badge/go-1.19+-blue.svg)](https://golang.org)
+[![Tor](https://img.shields.io/badge/tor-required-purple.svg)](https://torproject.org)
 # Pluto2 Onion SMTP
 
 A privacy-focused SMTP relay server designed for Tor hidden services with strong anonymity protections and mixnet architecture.
