@@ -1,4 +1,4 @@
-# Pluto2 SMTP Relay
+# Pluto2 Onion SMTP
 
 A privacy-focused SMTP relay server designed for Tor hidden services with strong anonymity protections and mixnet architecture.
 
