@@ -1,4 +1,4 @@
-# 🌫️ fog v0.9
+# 🌫️ fog v1.2.0
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.19+-00ADD8?logo=go)](https://golang.org/)
