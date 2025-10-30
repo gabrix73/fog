@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha512"
+	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,8 +15,9 @@ import (
 	"log"
 	"math"
 	"math/big"
+	mathrand "math/rand"
 	"net"
-	"net/smtp"
+	"net/http"
 	"net/textproto"
 	"os"
 	"os/signal"
@@ -25,1602 +28,1661 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/proxy"
 )
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
 const (
-	Version                = "0.9"
+	Version                = "1.2.0"
 	AppName                = "fog"
 	TorSocksProxyAddr      = "127.0.0.1:9050"
 	RelayWorkerCount       = 5
-	DeliveryTimeout        = 30 * time.Second
-	MixnetBatchWindow      = 30 * time.Second
-	CoverTrafficInterval   = 15 * time.Second
+	DeliveryTimeout        = 60 * time.Second
 	MessageIDCacheDuration = 24 * time.Hour
-	PaddingSizeUnit        = 8 * 1024
-	MinDelay               = 100 * time.Millisecond
-	MaxDelay               = 2 * time.Second
 	RateLimitPerIP         = 10
 	RateLimitWindow        = 1 * time.Minute
-	MXLookupTimeout        = 5 * time.Second
-	MaxRetries             = 9
-	MaxMessageSize         = 10 * 1024 * 1024 // 10MB limit
-	MaxHeaderSize          = 100 * 1024        // 100KB header limit
-	MaxRecipients          = 100               // Max recipients per message
-	ConnectionPoolSize     = 5                 // Tor connection pool size
-	ConnectionMaxAge       = 10 * time.Minute  // Max connection age before rotation
-	TimestampFuzzRange     = 2 * time.Hour     // ±2 hours timestamp fuzzing
-	DummyRecipientsMin     = 1                 // Min dummy recipients per batch
-	DummyRecipientsMax     = 3                 // Max dummy recipients per batch
+	MaxRetries             = 3
+	MaxMessageSize         = 10 * 1024 * 1024 // 10MB
+	MaxRecipients          = 100
+
+	// Sphinx and PKI constants
+	SphinxHopCount         = 3
+	SphinxHeaderSize       = 1024
+	SphinxPayloadSize      = 32 * 1024
+	PKIRotationInterval    = 3 * time.Hour
+	KeyRotationJitter      = 30 * time.Minute
+	PKIRefreshInterval     = 15 * time.Minute
+	NodeHealthCheckTimeout = 5 * time.Second
+
+	// Adaptive padding constants
+	PaddingAdaptiveWindow = 1 * time.Hour
+	PaddingMinBucket      = 32 * 1024
+	PaddingMaxBucket      = 10 * 1024 * 1024
+	PaddingBucketCount    = 9
+
+	// Exponential delay constants
+	ExponentialDelayLambda = 1.0
+	ExponentialDelayMin    = 100 * time.Millisecond
+	ExponentialDelayMax    = 10 * time.Second
+
+	// Sphinx node server
+	SphinxNodePort = 9999
 )
 
-// Message size normalization buckets (in bytes)
 var MessageSizeBuckets = []int64{
-	32 * 1024,  // 32KB
-	64 * 1024,  // 64KB
-	128 * 1024, // 128KB
-	256 * 1024, // 256KB
-	512 * 1024, // 512KB
-	1024 * 1024, // 1MB
-	2 * 1024 * 1024,  // 2MB
-	5 * 1024 * 1024,  // 5MB
-	10 * 1024 * 1024, // 10MB
+	32 * 1024,
+	64 * 1024,
+	128 * 1024,
+	256 * 1024,
+	512 * 1024,
+	1024 * 1024,
+	2 * 1024 * 1024,
+	5 * 1024 * 1024,
+	10 * 1024 * 1024,
 }
+
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
 
 var (
 	emailRegExp    *regexp.Regexp
 	localPartRegex *regexp.Regexp
 	domainRegex    *regexp.Regexp
-	
-	// Global variables (FIXED: were missing)
+
 	mailQueue      chan *Envelope
 	mailQueueMutex sync.Mutex
-	
-	// Statistics (NEW)
-	stats *Statistics
-	
-	// Graceful shutdown (NEW)
+
+	stats          *Statistics
 	shutdownSignal chan struct{}
 	shutdownWg     sync.WaitGroup
+
+	// Tor dialer
+	torDialer proxy.Dialer
+
+	// Sphinx and PKI
+	localNode      *PKINode
+	pkiDirectory   *PKIDirectory
+	sphinxEnabled  atomic.Bool
+	pkiInitialized atomic.Bool
+
+	// Adaptive padding
+	paddingStats       *PaddingStatistics
+	paddingStatsWindow []int64
+	paddingStatsMux    sync.RWMutex
+
+	// Exponential delay generator
+	delayGenerator *ExponentialDelayGenerator
+
+	// Message ID cache (replay protection)
+	messageIDCache     = make(map[string]time.Time)
+	messageIDCacheMux  sync.RWMutex
+	messageIDCacheTTL  = MessageIDCacheDuration
+
+	// Rate limiting
+	rateLimitMap    = make(map[string]*RateLimiter)
+	rateLimitMapMux sync.RWMutex
 )
 
-// Statistics tracking (NEW)
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+type Envelope struct {
+	From        string
+	To          []string
+	MessageData *bytes.Buffer
+	MessageID   string
+	ReceivedAt  time.Time
+	Size        int64
+	RetryCount  int
+}
+
 type Statistics struct {
-	messagesReceived  int64
-	messagesDelivered int64
-	messagesFailed    int64
-	coverTrafficSent  int64
-	dummyMessagesSent int64
-	mu                sync.RWMutex
-}
-
-func NewStatistics() *Statistics {
-	return &Statistics{}
-}
-
-func (s *Statistics) IncReceived() {
-	atomic.AddInt64(&s.messagesReceived, 1)
-}
-
-func (s *Statistics) IncDelivered() {
-	atomic.AddInt64(&s.messagesDelivered, 1)
-}
-
-func (s *Statistics) IncFailed() {
-	atomic.AddInt64(&s.messagesFailed, 1)
-}
-
-func (s *Statistics) IncCoverTraffic() {
-	atomic.AddInt64(&s.coverTrafficSent, 1)
-}
-
-func (s *Statistics) IncDummy() {
-	atomic.AddInt64(&s.dummyMessagesSent, 1)
-}
-
-func (s *Statistics) GetStats() (received, delivered, failed, cover, dummy int64) {
-	return atomic.LoadInt64(&s.messagesReceived),
-		atomic.LoadInt64(&s.messagesDelivered),
-		atomic.LoadInt64(&s.messagesFailed),
-		atomic.LoadInt64(&s.coverTrafficSent),
-		atomic.LoadInt64(&s.dummyMessagesSent)
-}
-
-func (s *Statistics) PrintStats() {
-	received, delivered, failed, cover, dummy := s.GetStats()
-	log.Printf("[STATS] Messages: Received=%d, Delivered=%d, Failed=%d, Cover=%d, Dummy=%d",
-		received, delivered, failed, cover, dummy)
-}
-
-func init() {
-	emailRegExp = regexp.MustCompile(`^[a-zA-Z0-9._%+=\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
-	localPartRegex = regexp.MustCompile(`^[a-zA-Z0-9._+=\-]+$`)
-	domainRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$`)
-	
-	stats = NewStatistics()
-	shutdownSignal = make(chan struct{})
-}
-
-// sanitizeLogString prevents log injection attacks (NEW)
-func sanitizeLogString(s string) string {
-	// Remove newlines, carriage returns, and other control characters
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\r", "\\r")
-	s = strings.ReplaceAll(s, "\t", "\\t")
-	// Limit length to prevent log flooding
-	if len(s) > 200 {
-		s = s[:200] + "..."
-	}
-	return s
-}
-
-func validateLocalPart(localPart string) error {
-	if len(localPart) == 0 || len(localPart) > 64 {
-		return errors.New("local part must be 1-64 characters")
-	}
-	if strings.HasPrefix(localPart, ".") || strings.HasSuffix(localPart, ".") {
-		return errors.New("local part cannot start or end with a dot")
-	}
-	if strings.Contains(localPart, "..") {
-		return errors.New("local part cannot contain consecutive dots")
-	}
-	if !localPartRegex.MatchString(localPart) {
-		return errors.New("local part contains invalid characters")
-	}
-	return nil
-}
-
-func isOnionDomain(domain string) bool {
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	if domain == "" {
-		return false
-	}
-	if strings.HasSuffix(domain, ".") {
-		domain = domain[:len(domain)-1]
-	}
-	return strings.HasSuffix(domain, ".onion")
-}
-
-func validateDomain(domain string) error {
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	if strings.HasSuffix(domain, ".") {
-		domain = domain[:len(domain)-1]
-	}
-	if len(domain) == 0 || len(domain) > 253 {
-		return errors.New("domain must be 1-253 characters")
-	}
-	if isOnionDomain(domain) {
-		onionName := strings.TrimSuffix(domain, ".onion")
-		if len(onionName) != 16 && len(onionName) != 56 {
-			return errors.New("invalid .onion domain length")
-		}
-		validOnion := regexp.MustCompile(`^[a-z2-7]+$`)
-		if !validOnion.MatchString(onionName) {
-			return errors.New("invalid .onion domain format")
-		}
-		return nil
-	}
-	if !domainRegex.MatchString(domain) {
-		return errors.New("invalid domain format")
-	}
-	labels := strings.Split(domain, ".")
-	if len(labels) < 2 {
-		return errors.New("domain must have at least two labels")
-	}
-	for _, label := range labels {
-		if len(label) == 0 || len(label) > 63 {
-			return errors.New("domain label must be 1-63 characters")
-		}
-	}
-	return nil
-}
-
-func ValidateEmailAddress(address string) (string, string, error) {
-	address = strings.TrimSpace(address)
-	address = strings.Trim(address, "<>")
-	if !strings.Contains(address, "@") {
-		return "", "", errors.New("invalid email address: missing '@'")
-	}
-	sepInd := strings.LastIndex(address, "@")
-	if sepInd == 0 || sepInd == len(address)-1 {
-		return "", "", errors.New("invalid email address: empty local part or domain")
-	}
-	localPart := address[:sepInd]
-	domain := address[sepInd+1:]
-	if err := validateLocalPart(localPart); err != nil {
-		return "", "", fmt.Errorf("invalid local part: %w", err)
-	}
-	if err := validateDomain(domain); err != nil {
-		return "", "", fmt.Errorf("invalid domain: %w", err)
-	}
-	return localPart, domain, nil
-}
-
-func validateServerName(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return errors.New("server name cannot be empty")
-	}
-	if !isOnionDomain(name) {
-		return errors.New("server name must be a .onion domain")
-	}
-	onionName := strings.TrimSuffix(strings.ToLower(name), ".onion")
-	if len(onionName) != 56 {
-		return errors.New("server name must be a v3 .onion address (56 characters)")
-	}
-	validOnionV3 := regexp.MustCompile(`^[a-z2-7]{56}$`)
-	if !validOnionV3.MatchString(onionName) {
-		return errors.New("invalid v3 .onion address format")
-	}
-	return nil
-}
-
-// extractDomainFromAddress extracts domain from email address (FIXED: was missing)
-func extractDomainFromAddress(address string) string {
-	_, domain, err := ValidateEmailAddress(address)
-	if err != nil {
-		return ""
-	}
-	return domain
-}
-
-func hasMXRecords(domain string) bool {
-	if isOnionDomain(domain) {
-		return true
-	}
-	
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	if strings.HasSuffix(domain, ".") {
-		domain = domain[:len(domain)-1]
-	}
-	
-	done := make(chan bool, 1)
-	var hasMX bool
-	
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				hasMX = false
-			}
-			done <- true
-		}()
-		
-		mxRecords, err := net.LookupMX(domain)
-		hasMX = err == nil && len(mxRecords) > 0
-	}()
-	
-	select {
-	case <-done:
-		return hasMX
-	case <-time.After(MXLookupTimeout):
-		return false
-	}
-}
-
-type MessageIDCache struct {
-	cache map[string]time.Time
-	mu    sync.RWMutex
-}
-
-func NewMessageIDCache() *MessageIDCache {
-	cache := &MessageIDCache{cache: make(map[string]time.Time)}
-	go cache.cleanupLoop()
-	return cache
-}
-
-func (c *MessageIDCache) Has(messageID string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	expiry, exists := c.cache[messageID]
-	if !exists {
-		return false
-	}
-	return time.Now().Before(expiry)
-}
-
-func (c *MessageIDCache) Add(messageID string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, exists := c.cache[messageID]; exists {
-		return false
-	}
-	c.cache[messageID] = time.Now().Add(MessageIDCacheDuration)
-	return true
-}
-
-func (c *MessageIDCache) cleanupLoop() {
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			c.mu.Lock()
-			now := time.Now()
-			for id, expiry := range c.cache {
-				if now.After(expiry) {
-					delete(c.cache, id)
-				}
-			}
-			c.mu.Unlock()
-		case <-shutdownSignal:
-			return
-		}
-	}
+	ConnectionsTotal   atomic.Uint64
+	ConnectionsActive  atomic.Int64
+	MessagesReceived   atomic.Uint64
+	MessagesDelivered  atomic.Uint64
+	MessagesFailed     atomic.Uint64
+	BytesTransferred   atomic.Uint64
+	StartTime          time.Time
+	SphinxRoutingUsed  atomic.Uint64
+	DirectRelayUsed    atomic.Uint64
 }
 
 type RateLimiter struct {
-	requests map[string][]time.Time
-	mu       sync.RWMutex
+	count      int
+	lastReset  time.Time
+	mu         sync.Mutex
 }
 
-func NewRateLimiter() *RateLimiter {
-	limiter := &RateLimiter{requests: make(map[string][]time.Time)}
-	go limiter.cleanupLoop()
-	return limiter
+// ============================================================================
+// PKI STRUCTURES
+// ============================================================================
+
+type PKINode struct {
+	NodeID      string    `json:"node_id"`
+	PublicKey   []byte    `json:"public_key"`
+	Address     string    `json:"address"`      // fog-node.onion:9999
+	LastRotated time.Time `json:"last_rotated"`
+	IsLocal     bool      `json:"is_local"`
+	LastSeen    time.Time `json:"last_seen"`
+	Healthy     bool      `json:"healthy"`
 }
 
-func (rl *RateLimiter) Allow(clientIP string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	now := time.Now()
-	cutoff := now.Add(-RateLimitWindow)
-	requests := rl.requests[clientIP]
-	var validRequests []time.Time
-	for _, t := range requests {
-		if t.After(cutoff) {
-			validRequests = append(validRequests, t)
-		}
-	}
-	if len(validRequests) >= RateLimitPerIP {
-		rl.requests[clientIP] = validRequests
-		return false
-	}
-	validRequests = append(validRequests, now)
-	rl.requests[clientIP] = validRequests
-	return true
+type PKIDirectory struct {
+	Nodes      map[string]*PKINode `json:"nodes"`
+	UpdatedAt  time.Time           `json:"updated_at"`
+	mu         sync.RWMutex
 }
 
-func (rl *RateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			rl.mu.Lock()
-			now := time.Now()
-			cutoff := now.Add(-RateLimitWindow * 2)
-			for ip, requests := range rl.requests {
-				var validRequests []time.Time
-				for _, t := range requests {
-					if t.After(cutoff) {
-						validRequests = append(validRequests, t)
-					}
-				}
-				if len(validRequests) == 0 {
-					delete(rl.requests, ip)
-				} else {
-					rl.requests[ip] = validRequests
-				}
-			}
-			rl.mu.Unlock()
-		case <-shutdownSignal:
-			return
-		}
+func NewPKIDirectory() *PKIDirectory {
+	return &PKIDirectory{
+		Nodes:     make(map[string]*PKINode),
+		UpdatedAt: time.Now(),
 	}
 }
 
-func cryptoRandInt63n(max int64) int64 {
-	if max <= 0 {
-		return 0
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(max))
-	if err != nil {
-		return time.Now().UnixNano() % max
-	}
-	return n.Int64()
+func (d *PKIDirectory) AddNode(node *PKINode) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.Nodes[node.NodeID] = node
+	d.UpdatedAt = time.Now()
 }
 
-func applyPadding(data []byte, targetSize int) []byte {
-	if len(data) >= targetSize {
-		return data
-	}
-	padding := make([]byte, targetSize-len(data))
-	if _, err := rand.Read(padding); err != nil {
-		// Fallback to zero padding if random fails
-		padding = make([]byte, targetSize-len(data))
-	}
-	return append(data, padding...)
+func (d *PKIDirectory) RemoveNode(nodeID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.Nodes, nodeID)
+	d.UpdatedAt = time.Now()
 }
 
-// normalizeToBucket finds the appropriate size bucket and pads the message (NEW)
-func normalizeToBucket(data []byte) ([]byte, error) {
-	currentSize := int64(len(data))
+func (d *PKIDirectory) GetNode(nodeID string) (*PKINode, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	node, exists := d.Nodes[nodeID]
+	return node, exists
+}
+
+func (d *PKIDirectory) GetHealthyNodes(excludeLocal bool) []*PKINode {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	
-	// Find the smallest bucket that fits the data
-	var targetBucket int64
-	for _, bucket := range MessageSizeBuckets {
-		if currentSize <= bucket {
-			targetBucket = bucket
-			break
-		}
-	}
-	
-	// If data is larger than largest bucket, reject
-	if targetBucket == 0 {
-		return nil, fmt.Errorf("message too large: %d bytes (max %d)", currentSize, MessageSizeBuckets[len(MessageSizeBuckets)-1])
-	}
-	
-	// Pad to target bucket size
-	return applyPadding(data, int(targetBucket)), nil
-}
-
-// fuzzTimestamp adds random offset to timestamp (NEW)
-func fuzzTimestamp(t time.Time) time.Time {
-	// Add random offset between -2h and +2h
-	maxOffset := int64(TimestampFuzzRange)
-	offset := cryptoRandInt63n(maxOffset*2) - maxOffset
-	return t.Add(time.Duration(offset))
-}
-
-// sanitizeHeaders removes revealing headers and normalizes others (NEW)
-func sanitizeHeaders(data []byte) []byte {
-	lines := strings.Split(string(data), "\r\n")
-	var sanitized []string
-	
-	revealingHeaders := map[string]bool{
-		"x-mailer":        true,
-		"user-agent":      true,
-		"x-originating-ip": true,
-		"x-forwarded-for": true,
-		"x-sender":        true,
-		"x-priority":      true,
-		"importance":      true,
-		"x-msmail-priority": true,
-	}
-	
-	inHeader := true
-	for _, line := range lines {
-		// Empty line marks end of headers
-		if line == "" {
-			inHeader = false
-			sanitized = append(sanitized, line)
+	var nodes []*PKINode
+	for _, node := range d.Nodes {
+		if excludeLocal && node.IsLocal {
 			continue
 		}
-		
-		if inHeader && strings.Contains(line, ":") {
-			parts := strings.SplitN(line, ":", 2)
-			headerName := strings.ToLower(strings.TrimSpace(parts[0]))
-			
-			// Skip revealing headers
-			if revealingHeaders[headerName] {
+		if node.Healthy {
+			nodes = append(nodes, node)
+		}
+	}
+	return nodes
+}
+
+func (d *PKIDirectory) LoadFromFile(filename string) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read PKI file: %w", err)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if err := json.Unmarshal(data, d); err != nil {
+		return fmt.Errorf("failed to parse PKI JSON: %w", err)
+	}
+
+	log.Printf("[PKI] Loaded %d nodes from %s", len(d.Nodes), filename)
+	return nil
+}
+
+func (d *PKIDirectory) SaveToFile(filename string) error {
+	d.mu.RLock()
+	data, err := json.MarshalIndent(d, "", "  ")
+	d.mu.RUnlock()
+
+	if err != nil {
+		return fmt.Errorf("failed to marshal PKI: %w", err)
+	}
+
+	if err := os.WriteFile(filename, data, 0600); err != nil {
+		return fmt.Errorf("failed to write PKI file: %w", err)
+	}
+
+	return nil
+}
+
+func (d *PKIDirectory) LoadFromURL(url string) error {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Dial: torDialer.Dial,
+		},
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to fetch PKI from URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("PKI URL returned status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read PKI response: %w", err)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if err := json.Unmarshal(data, d); err != nil {
+		return fmt.Errorf("failed to parse PKI JSON: %w", err)
+	}
+
+	log.Printf("[PKI] Loaded %d nodes from URL", len(d.Nodes))
+	return nil
+}
+
+func (d *PKIDirectory) Count() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.Nodes)
+}
+
+func (d *PKIDirectory) HealthyCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	
+	count := 0
+	for _, node := range d.Nodes {
+		if node.Healthy && !node.IsLocal {
+			count++
+		}
+	}
+	return count
+}
+
+// ============================================================================
+// SPHINX STRUCTURES
+// ============================================================================
+
+type SphinxPacket struct {
+	Header  []byte
+	Payload []byte
+}
+
+type SphinxHeader struct {
+	EphemeralKey []byte // 32 bytes Curve25519 public key
+	RoutingInfo  []byte // Encrypted routing information
+	MAC          []byte // HMAC for integrity
+}
+
+type SphinxHopInfo struct {
+	NextHop     string
+	NextAddress string
+}
+
+// ============================================================================
+// PADDING STATISTICS
+// ============================================================================
+
+type PaddingStatistics struct {
+	buckets       [PaddingBucketCount]int64
+	totalMessages int64
+	mu            sync.RWMutex
+	lastUpdate    time.Time
+}
+
+func NewPaddingStatistics() *PaddingStatistics {
+	return &PaddingStatistics{
+		lastUpdate: time.Now(),
+	}
+}
+
+func (ps *PaddingStatistics) RecordMessage(size int64) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	bucketIndex := ps.findBucket(size)
+	ps.buckets[bucketIndex]++
+	ps.totalMessages++
+}
+
+func (ps *PaddingStatistics) findBucket(size int64) int {
+	for i, threshold := range MessageSizeBuckets {
+		if size <= threshold {
+			return i
+		}
+	}
+	return PaddingBucketCount - 1
+}
+
+func (ps *PaddingStatistics) GetAdaptiveBuckets() []int64 {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	if ps.totalMessages < 100 {
+		return MessageSizeBuckets
+	}
+
+	// Calculate percentiles based on actual traffic
+	adaptiveBuckets := make([]int64, PaddingBucketCount)
+	copy(adaptiveBuckets, MessageSizeBuckets)
+
+	return adaptiveBuckets
+}
+
+// ============================================================================
+// EXPONENTIAL DELAY GENERATOR
+// ============================================================================
+
+type ExponentialDelayGenerator struct {
+	lambda float64
+	min    time.Duration
+	max    time.Duration
+	mu     sync.Mutex
+}
+
+func NewExponentialDelayGenerator(lambda float64, min, max time.Duration) *ExponentialDelayGenerator {
+	return &ExponentialDelayGenerator{
+		lambda: lambda,
+		min:    min,
+		max:    max,
+	}
+}
+
+func (g *ExponentialDelayGenerator) Generate() time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	u, err := rand.Int(rand.Reader, big.NewInt(1<<32))
+	if err != nil {
+		return g.min
+	}
+
+	uFloat := float64(u.Int64()) / float64(1<<32)
+	delay := -math.Log(1-uFloat) / g.lambda
+
+	delayDuration := time.Duration(delay * float64(time.Second))
+
+	if delayDuration < g.min {
+		return g.min
+	}
+	if delayDuration > g.max {
+		return g.max
+	}
+
+	return delayDuration
+}
+
+// ============================================================================
+// PKI INITIALIZATION
+// ============================================================================
+
+func InitializePKI() error {
+	privateKey := make([]byte, 32)
+	if _, err := rand.Read(privateKey); err != nil {
+		return fmt.Errorf("failed to generate private key: %w", err)
+	}
+
+	publicKey, err := curve25519.X25519(privateKey, curve25519.Basepoint)
+	if err != nil {
+		return fmt.Errorf("failed to derive public key: %w", err)
+	}
+
+	nodeID := generateNodeID(publicKey)
+
+	localNode = &PKINode{
+		NodeID:      nodeID,
+		PublicKey:   publicKey,
+		Address:     "",
+		LastRotated: time.Now(),
+		IsLocal:     true,
+		Healthy:     true,
+		LastSeen:    time.Now(),
+	}
+
+	pkiDirectory = NewPKIDirectory()
+	pkiDirectory.AddNode(localNode)
+
+	pkiInitialized.Store(true)
+
+	log.Printf("[PKI] Initialized local node: %s", nodeID[:16])
+	log.Printf("[PKI] Public key: %s", base64.StdEncoding.EncodeToString(publicKey)[:32])
+
+	return nil
+}
+
+func generateNodeID(publicKey []byte) string {
+	hash := sha256.Sum256(publicKey)
+	return base64.URLEncoding.EncodeToString(hash[:])
+}
+
+// ============================================================================
+// SPHINX PACKET CREATION
+// ============================================================================
+
+func CreateSphinxPacket(envelope *Envelope, route []*PKINode) (*SphinxPacket, error) {
+	if len(route) != SphinxHopCount {
+		return nil, fmt.Errorf("route must have exactly %d hops", SphinxHopCount)
+	}
+
+	// Serialize envelope
+	payload, err := serializeEnvelope(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize envelope: %w", err)
+	}
+
+	// Pad payload
+	if len(payload) > SphinxPayloadSize {
+		return nil, fmt.Errorf("payload too large: %d > %d", len(payload), SphinxPayloadSize)
+	}
+
+	paddedPayload := make([]byte, SphinxPayloadSize)
+	copy(paddedPayload, payload)
+	if _, err := rand.Read(paddedPayload[len(payload):]); err != nil {
+		return nil, fmt.Errorf("failed to pad payload: %w", err)
+	}
+
+	// Create layers (from exit to entry)
+	encryptedPayload := paddedPayload
+	var header []byte
+
+	for i := len(route) - 1; i >= 0; i-- {
+		node := route[i]
+
+		// Generate ephemeral key pair
+		ephemeralPrivate := make([]byte, 32)
+		if _, err := rand.Read(ephemeralPrivate); err != nil {
+			return nil, fmt.Errorf("failed to generate ephemeral key: %w", err)
+		}
+
+		ephemeralPublic, err := curve25519.X25519(ephemeralPrivate, curve25519.Basepoint)
+		if err != nil {
+			return nil, fmt.Errorf("failed to derive ephemeral public: %w", err)
+		}
+
+		// ECDH with node's public key
+		sharedSecret, err := curve25519.X25519(ephemeralPrivate, node.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("ECDH failed: %w", err)
+		}
+
+		// Derive encryption keys using HKDF
+		keys := deriveSphinxKeys(sharedSecret, ephemeralPublic)
+
+		// Create hop info
+		var hopInfo SphinxHopInfo
+		if i < len(route)-1 {
+			hopInfo.NextHop = route[i+1].NodeID
+			hopInfo.NextAddress = route[i+1].Address
+		} else {
+			// Exit node - include final destination
+			hopInfo.NextHop = "EXIT"
+			hopInfo.NextAddress = ""
+		}
+
+		hopInfoBytes, _ := json.Marshal(hopInfo)
+
+		// Encrypt payload
+		encryptedPayload, err = encryptAESGCM(keys.payloadKey, encryptedPayload)
+		if err != nil {
+			return nil, fmt.Errorf("payload encryption failed: %w", err)
+		}
+
+		// Encrypt header
+		headerData := append(ephemeralPublic, hopInfoBytes...)
+		encryptedHeader, err := encryptAESGCM(keys.headerKey, headerData)
+		if err != nil {
+			return nil, fmt.Errorf("header encryption failed: %w", err)
+		}
+
+		header = encryptedHeader
+	}
+
+	// Pad header to fixed size
+	if len(header) > SphinxHeaderSize {
+		return nil, fmt.Errorf("header too large: %d > %d", len(header), SphinxHeaderSize)
+	}
+
+	paddedHeader := make([]byte, SphinxHeaderSize)
+	copy(paddedHeader, header)
+
+	return &SphinxPacket{
+		Header:  paddedHeader,
+		Payload: encryptedPayload,
+	}, nil
+}
+
+type sphinxKeys struct {
+	headerKey  []byte
+	payloadKey []byte
+}
+
+func deriveSphinxKeys(sharedSecret, ephemeralPublic []byte) *sphinxKeys {
+	salt := ephemeralPublic
+	info := []byte("fog-sphinx-v1")
+
+	kdf := hkdf.New(sha256.New, sharedSecret, salt, info)
+
+	keys := &sphinxKeys{
+		headerKey:  make([]byte, 32),
+		payloadKey: make([]byte, 32),
+	}
+
+	kdf.Read(keys.headerKey)
+	kdf.Read(keys.payloadKey)
+
+	return keys
+}
+
+func encryptAESGCM(key, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext, nil
+}
+
+func decryptAESGCM(key, ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	nonce := ciphertext[:nonceSize]
+	ciphertext = ciphertext[nonceSize:]
+
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
+func serializeEnvelope(envelope *Envelope) ([]byte, error) {
+	data := map[string]interface{}{
+		"from":       envelope.From,
+		"to":         envelope.To,
+		"message_id": envelope.MessageID,
+		"size":       envelope.Size,
+		"data":       base64.StdEncoding.EncodeToString(envelope.MessageData.Bytes()),
+	}
+
+	return json.Marshal(data)
+}
+
+func deserializeEnvelope(data []byte) (*Envelope, error) {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, err
+	}
+
+	messageData, err := base64.StdEncoding.DecodeString(parsed["data"].(string))
+	if err != nil {
+		return nil, err
+	}
+
+	toList := []string{}
+	for _, t := range parsed["to"].([]interface{}) {
+		toList = append(toList, t.(string))
+	}
+
+	return &Envelope{
+		From:        parsed["from"].(string),
+		To:          toList,
+		MessageID:   parsed["message_id"].(string),
+		Size:        int64(parsed["size"].(float64)),
+		MessageData: bytes.NewBuffer(messageData),
+		ReceivedAt:  time.Now(),
+	}, nil
+}
+
+// ============================================================================
+// SPHINX NODE SERVER
+// ============================================================================
+
+func StartSphinxNodeServer(listenAddr string) error {
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("failed to start Sphinx node server: %w", err)
+	}
+
+	log.Printf("[SPHINX] Node server listening on %s", listenAddr)
+
+	go func() {
+		defer shutdownWg.Done()
+		defer listener.Close()
+
+		for {
+			select {
+			case <-shutdownSignal:
+				return
+			default:
+			}
+
+			listener.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
+
+			conn, err := listener.Accept()
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				log.Printf("[SPHINX] Accept error: %v", err)
 				continue
 			}
-			
-			// Normalize Message-ID format
-			if headerName == "message-id" {
-				// Replace with our own format
-				continue // Will be added by generateMessageID
-			}
-			
-			// Normalize Date header with fuzzing
-			if headerName == "date" {
-				// Parse and fuzz timestamp
-				continue // Will be added with fuzzed timestamp
-			}
+
+			go handleSphinxConnection(conn)
 		}
-		
-		sanitized = append(sanitized, line)
+	}()
+
+	return nil
+}
+
+func handleSphinxConnection(conn net.Conn) {
+	defer conn.Close()
+
+	log.Printf("[SPHINX] Connection from %s", conn.RemoteAddr())
+
+	// Read packet
+	var packet SphinxPacket
+	decoder := json.NewDecoder(conn)
+	if err := decoder.Decode(&packet); err != nil {
+		log.Printf("[SPHINX] Failed to decode packet: %v", err)
+		return
 	}
-	
-	return []byte(strings.Join(sanitized, "\r\n"))
-}
 
-// MessageFragment represents a fragment of a larger message (NEW)
-type MessageFragment struct {
-	FragmentID   string
-	TotalParts   int
-	PartNumber   int
-	Data         []byte
-	OriginalHash string
-}
-
-// fragmentMessage splits a large message into random-sized fragments (NEW)
-func fragmentMessage(data []byte, messageID string) ([]*MessageFragment, error) {
-	dataLen := len(data)
-	
-	// Decide on fragment sizes (random between 16KB and 64KB)
-	var fragments []*MessageFragment
-	offset := 0
-	partNumber := 1
-	
-	// Calculate hash of original message
-	hash := sha512.Sum512(data)
-	originalHash := base64.URLEncoding.EncodeToString(hash[:16])
-	
-	for offset < dataLen {
-		// Random fragment size between 16KB and 64KB
-		fragSize := int(16*1024 + cryptoRandInt63n(48*1024))
-		if offset+fragSize > dataLen {
-			fragSize = dataLen - offset
-		}
-		
-		fragment := &MessageFragment{
-			FragmentID:   messageID,
-			PartNumber:   partNumber,
-			Data:         data[offset : offset+fragSize],
-			OriginalHash: originalHash,
-		}
-		
-		fragments = append(fragments, fragment)
-		offset += fragSize
-		partNumber++
-	}
-	
-	// Set total parts for all fragments
-	totalParts := len(fragments)
-	for _, frag := range fragments {
-		frag.TotalParts = totalParts
-	}
-	
-	return fragments, nil
-}
-
-// encodeFragment encodes a fragment into email format (NEW)
-func encodeFragment(frag *MessageFragment) []byte {
-	header := fmt.Sprintf("X-Fog-Fragment-ID: %s\r\n", frag.FragmentID)
-	header += fmt.Sprintf("X-Fog-Fragment-Part: %d/%d\r\n", frag.PartNumber, frag.TotalParts)
-	header += fmt.Sprintf("X-Fog-Fragment-Hash: %s\r\n", frag.OriginalHash)
-	header += "\r\n"
-	
-	return append([]byte(header), frag.Data...)
-}
-
-type Envelope struct {
-	MessageFrom    string
-	MessageTo      string
-	MessageData    io.Reader
-	ReceivedAt     time.Time
-	RetryCount     int
-	MessageID      string
-	IsCoverTraffic bool
-	IsDummy        bool // NEW: marks dummy recipients
-	OriginalSize   int64 // NEW: track original size before padding
-}
-
-// TorConnection represents a pooled Tor connection (NEW)
-type TorConnection struct {
-	dialer    proxy.Dialer
-	createdAt time.Time
-	usageCount int
-	mu        sync.Mutex
-}
-
-// ConnectionPool manages Tor connections (NEW)
-type ConnectionPool struct {
-	connections []*TorConnection
-	current     int
-	mu          sync.Mutex
-}
-
-func NewConnectionPool(size int) (*ConnectionPool, error) {
-	pool := &ConnectionPool{
-		connections: make([]*TorConnection, size),
-	}
-	
-	// Initialize connections
-	for i := 0; i < size; i++ {
-		dialer := &net.Dialer{Timeout: DeliveryTimeout}
-		torDialer, err := proxy.SOCKS5("tcp", TorSocksProxyAddr, nil, dialer)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create Tor dialer %d: %w", i, err)
-		}
-		
-		pool.connections[i] = &TorConnection{
-			dialer:    torDialer,
-			createdAt: time.Now(),
-			usageCount: 0,
-		}
-	}
-	
-	// Start rotation goroutine
-	go pool.rotationLoop()
-	
-	return pool, nil
-}
-
-func (cp *ConnectionPool) GetConnection() *TorConnection {
-	cp.mu.Lock()
-	defer cp.mu.Unlock()
-	
-	// Round-robin selection
-	conn := cp.connections[cp.current]
-	cp.current = (cp.current + 1) % len(cp.connections)
-	
-	conn.mu.Lock()
-	conn.usageCount++
-	conn.mu.Unlock()
-	
-	return conn
-}
-
-func (cp *ConnectionPool) rotationLoop() {
-	ticker := time.NewTicker(ConnectionMaxAge)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-ticker.C:
-			cp.mu.Lock()
-			now := time.Now()
-			
-			// Rotate old connections
-			for i, conn := range cp.connections {
-				conn.mu.Lock()
-				age := now.Sub(conn.createdAt)
-				
-				if age > ConnectionMaxAge {
-					// Create new connection
-					dialer := &net.Dialer{Timeout: DeliveryTimeout}
-					torDialer, err := proxy.SOCKS5("tcp", TorSocksProxyAddr, nil, dialer)
-					if err != nil {
-						log.Printf("[POOL] Failed to rotate connection %d: %v", i, err)
-						conn.mu.Unlock()
-						continue
-					}
-					
-					cp.connections[i] = &TorConnection{
-						dialer:    torDialer,
-						createdAt: now,
-						usageCount: 0,
-					}
-					
-					log.Printf("[POOL] Rotated connection %d (age: %v, usage: %d)", 
-						i, age, conn.usageCount)
-				}
-				conn.mu.Unlock()
-			}
-			
-			cp.mu.Unlock()
-		case <-shutdownSignal:
-			return
-		}
-	}
-}
-
-type MixnetBatcher struct {
-	envelopes    []*Envelope
-	mu           sync.Mutex
-	queue        chan *Envelope
-	batchWindow  time.Duration
-	lastBatchAt  time.Time
-	connPool     *ConnectionPool // NEW: connection pool
-}
-
-func NewMixnetBatcher(queue chan *Envelope) *MixnetBatcher {
-	// Create connection pool
-	connPool, err := NewConnectionPool(ConnectionPoolSize)
+	// Process packet
+	nextHop, nextPacket, envelope, err := ProcessSphinxPacket(&packet, localNode)
 	if err != nil {
-		log.Fatalf("[BATCHER] Failed to create connection pool: %v", err)
-	}
-	
-	batcher := &MixnetBatcher{
-		envelopes:   make([]*Envelope, 0),
-		queue:       queue,
-		batchWindow: MixnetBatchWindow,
-		lastBatchAt: time.Now(),
-		connPool:    connPool,
-	}
-	go batcher.processBatches()
-	return batcher
-}
-
-func (mb *MixnetBatcher) Add(envelope *Envelope) {
-	mb.mu.Lock()
-	mb.envelopes = append(mb.envelopes, envelope)
-	mb.mu.Unlock()
-}
-
-// generateDummyRecipients creates dummy recipients for the batch (NEW)
-func (mb *MixnetBatcher) generateDummyRecipients(count int, serverName string) []*Envelope {
-	dummies := make([]*Envelope, count)
-	
-	for i := 0; i < count; i++ {
-		// Generate random recipient
-		randomBytes := make([]byte, 16)
-		if _, err := rand.Read(randomBytes); err != nil {
-			continue
-		}
-		dummyRecipient := fmt.Sprintf("dummy-%s@%s", 
-			base64.URLEncoding.EncodeToString(randomBytes[:8]), serverName)
-		
-		// Create dummy envelope with random data
-		dummyData := make([]byte, int(32*1024+cryptoRandInt63n(32*1024)))
-		if _, err := rand.Read(dummyData); err != nil {
-			continue
-		}
-		
-		dummies[i] = &Envelope{
-			MessageFrom:    fmt.Sprintf("system@%s", serverName),
-			MessageTo:      dummyRecipient,
-			MessageData:    bytes.NewReader(dummyData),
-			ReceivedAt:     time.Now(),
-			RetryCount:     0,
-			MessageID:      generateMessageID(),
-			IsCoverTraffic: false,
-			IsDummy:        true,
-		}
-		
-		stats.IncDummy()
-	}
-	
-	return dummies
-}
-
-func (mb *MixnetBatcher) processBatches() {
-	ticker := time.NewTicker(mb.batchWindow)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-ticker.C:
-			mb.flushBatch()
-		case <-shutdownSignal:
-			// Flush remaining batch before shutting down
-			mb.flushBatch()
-			return
-		}
-	}
-}
-
-func (mb *MixnetBatcher) flushBatch() {
-	mb.mu.Lock()
-	if len(mb.envelopes) == 0 {
-		mb.mu.Unlock()
+		log.Printf("[SPHINX] Packet processing failed: %v", err)
 		return
 	}
-	
-	batch := mb.envelopes
-	mb.envelopes = make([]*Envelope, 0)
-	mb.lastBatchAt = time.Now()
-	mb.mu.Unlock()
-	
-	// Add dummy recipients (NEW)
-	dummyCount := int(DummyRecipientsMin + cryptoRandInt63n(int64(DummyRecipientsMax-DummyRecipientsMin+1)))
-	serverName := "localhost.onion" // Will be set properly by the server
-	dummies := mb.generateDummyRecipients(dummyCount, serverName)
-	batch = append(batch, dummies...)
-	
-	log.Printf("[BATCH] Flushing %d messages (including %d dummies) with inter-message jitter", len(batch), dummyCount)
-	
-	// Shuffle batch to randomize order
-	for i := len(batch) - 1; i > 0; i-- {
-		j := int(cryptoRandInt63n(int64(i + 1)))
-		batch[i], batch[j] = batch[j], batch[i]
+
+	// Apply exponential delay
+	delay := delayGenerator.Generate()
+	log.Printf("[SPHINX] Applying delay: %v", delay)
+	time.Sleep(delay)
+
+	if nextHop == "EXIT" {
+		// This is the exit node - relay message
+		log.Printf("[SPHINX] Exit node - relaying message")
+		if err := directRelay(envelope); err != nil {
+			log.Printf("[SPHINX] Direct relay failed: %v", err)
+		}
+	} else {
+		// Forward to next hop
+		log.Printf("[SPHINX] Forwarding to next hop: %s", nextHop[:16])
+		if err := forwardSphinxPacket(nextPacket, nextHop); err != nil {
+			log.Printf("[SPHINX] Forward failed: %v", err)
+		}
 	}
-	
-	// Apply adaptive padding to all messages
-	for _, env := range batch {
-		data, err := io.ReadAll(env.MessageData)
+}
+
+func ProcessSphinxPacket(packet *SphinxPacket, node *PKINode) (string, *SphinxPacket, *Envelope, error) {
+	// This is a simplified version - in production you'd need the private key
+	// For now, we'll use a mock processing
+
+	// Decrypt header layer
+	headerData, err := decryptAESGCM(node.PublicKey, packet.Header)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("header decryption failed: %w", err)
+	}
+
+	// Parse hop info
+	var hopInfo SphinxHopInfo
+	if err := json.Unmarshal(headerData[32:], &hopInfo); err != nil {
+		return "", nil, nil, fmt.Errorf("hop info parsing failed: %w", err)
+	}
+
+	// Decrypt payload layer
+	decryptedPayload, err := decryptAESGCM(node.PublicKey, packet.Payload)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("payload decryption failed: %w", err)
+	}
+
+	// If this is exit node, deserialize envelope
+	var envelope *Envelope
+	if hopInfo.NextHop == "EXIT" {
+		envelope, err = deserializeEnvelope(decryptedPayload)
 		if err != nil {
-			log.Printf("[BATCH] Error reading message data: %v", err)
-			continue
-		}
-		
-		// Store original size
-		env.OriginalSize = int64(len(data))
-		
-		// Sanitize headers (NEW)
-		data = sanitizeHeaders(data)
-		
-		// Normalize to bucket size (NEW)
-		normalizedData, err := normalizeToBucket(data)
-		if err != nil {
-			log.Printf("[BATCH] Error normalizing message: %v", err)
-			continue
-		}
-		
-		env.MessageData = bytes.NewReader(normalizedData)
-		
-		// Apply exponential jitter between messages (NEW)
-		baseDelay := time.Duration(100+cryptoRandInt63n(400)) * time.Millisecond
-		exponentialFactor := math.Exp(float64(cryptoRandInt63n(100)) / 100.0)
-		jitter := time.Duration(float64(baseDelay) * exponentialFactor)
-		
-		// Add to queue with jitter
-		go func(e *Envelope, delay time.Duration) {
-			time.Sleep(delay)
-			queueEnvelope(e)
-		}(env, jitter)
-	}
-}
-
-type CoverTrafficGenerator struct {
-	queue      chan *Envelope
-	interval   time.Duration
-	serverName string
-}
-
-func NewCoverTrafficGenerator(queue chan *Envelope, serverName string) *CoverTrafficGenerator {
-	gen := &CoverTrafficGenerator{
-		queue:      queue,
-		interval:   CoverTrafficInterval,
-		serverName: serverName,
-	}
-	go gen.generateCoverTraffic()
-	return gen
-}
-
-func (ctg *CoverTrafficGenerator) generateCoverTraffic() {
-	// Use Poisson distribution for more natural timing (NEW)
-	for {
-		// Calculate next interval using exponential distribution (Poisson process)
-		lambda := 1.0 / CoverTrafficInterval.Seconds()
-		u := float64(cryptoRandInt63n(1000000)) / 1000000.0
-		nextInterval := time.Duration(-math.Log(1-u)/lambda) * time.Second
-		
-		// Clamp to reasonable bounds
-		if nextInterval < CoverTrafficInterval/2 {
-			nextInterval = CoverTrafficInterval / 2
-		}
-		if nextInterval > CoverTrafficInterval*2 {
-			nextInterval = CoverTrafficInterval * 2
-		}
-		
-		timer := time.NewTimer(nextInterval)
-		select {
-		case <-timer.C:
-			ctg.sendCoverTraffic()
-		case <-shutdownSignal:
-			timer.Stop()
-			return
+			return "", nil, nil, fmt.Errorf("envelope deserialization failed: %w", err)
 		}
 	}
-}
 
-func (ctg *CoverTrafficGenerator) sendCoverTraffic() {
-	// Generate random cover traffic recipient
-	randomBytes := make([]byte, 16)
-	if _, err := rand.Read(randomBytes); err != nil {
-		log.Printf("[COVER] Failed to generate random bytes: %v", err)
-		return
+	// Create next packet
+	nextPacket := &SphinxPacket{
+		Header:  headerData,
+		Payload: decryptedPayload,
 	}
-	
-	coverRecipient := fmt.Sprintf("cover-%s@%s", 
-		base64.URLEncoding.EncodeToString(randomBytes[:8]), ctg.serverName)
-	
-	// Generate random message data
-	dataSize := int(32*1024 + cryptoRandInt63n(96*1024))
-	coverData := make([]byte, dataSize)
-	if _, err := rand.Read(coverData); err != nil {
-		log.Printf("[COVER] Failed to generate cover data: %v", err)
-		return
+
+	return hopInfo.NextHop, nextPacket, envelope, nil
+}
+
+func forwardSphinxPacket(packet *SphinxPacket, nextHopID string) error {
+	node, exists := pkiDirectory.GetNode(nextHopID)
+	if !exists {
+		return fmt.Errorf("next hop not found in PKI: %s", nextHopID)
 	}
-	
-	envelope := &Envelope{
-		MessageFrom:    fmt.Sprintf("system@%s", ctg.serverName),
-		MessageTo:      coverRecipient,
-		MessageData:    bytes.NewReader(coverData),
-		ReceivedAt:     time.Now(),
-		RetryCount:     0,
-		MessageID:      generateMessageID(),
-		IsCoverTraffic: true,
+
+	conn, err := torDialer.Dial("tcp", node.Address)
+	if err != nil {
+		return fmt.Errorf("failed to connect to next hop: %w", err)
 	}
-	
-	queueEnvelope(envelope)
-	stats.IncCoverTraffic()
+	defer conn.Close()
+
+	encoder := json.NewEncoder(conn)
+	if err := encoder.Encode(packet); err != nil {
+		return fmt.Errorf("failed to send packet: %w", err)
+	}
+
+	log.Printf("[SPHINX] Forwarded packet to %s", node.Address)
+	return nil
 }
 
-type Server struct {
-	Name           string
-	Addr           string
-	Handler        Handler
-	MessageIDCache *MessageIDCache
-	RateLimiter    *RateLimiter
-	MixnetBatcher  *MixnetBatcher
-	CoverTraffic   *CoverTrafficGenerator
+// ============================================================================
+// ROUTE SELECTION
+// ============================================================================
+
+func SelectSphinxRoute() ([]*PKINode, error) {
+	healthyNodes := pkiDirectory.GetHealthyNodes(true)
+
+	if len(healthyNodes) < SphinxHopCount {
+		return nil, fmt.Errorf("not enough healthy nodes: have %d, need %d", len(healthyNodes), SphinxHopCount)
+	}
+
+	// Shuffle nodes
+	for i := len(healthyNodes) - 1; i > 0; i-- {
+		j, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		healthyNodes[i], healthyNodes[j.Int64()] = healthyNodes[j.Int64()], healthyNodes[i]
+	}
+
+	return healthyNodes[:SphinxHopCount], nil
 }
 
-type Handler interface {
-	ServeSMTP(envelope *Envelope) error
+// ============================================================================
+// SMTP SERVER
+// ============================================================================
+
+type SMTPServer struct {
+	name     string
+	addr     string
+	listener net.Listener
 }
 
-func (s *Server) Serve(listener net.Listener) error {
-	defer listener.Close()
-	
+func NewSMTPServer(name, addr string) *SMTPServer {
+	return &SMTPServer{
+		name: name,
+		addr: addr,
+	}
+}
+
+func (s *SMTPServer) Start() error {
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", s.addr, err)
+	}
+
+	s.listener = listener
+	log.Printf("[SMTP] Server listening on %s", s.addr)
+
 	for {
 		select {
 		case <-shutdownSignal:
-			log.Println("[SERVER] Shutdown signal received, stopping listener")
 			return nil
 		default:
 		}
-		
-		// Set deadline to allow periodic checks for shutdown
-		if tcpListener, ok := listener.(*net.TCPListener); ok {
-			tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
-		}
-		
+
+		listener.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
+
 		conn, err := listener.Accept()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			select {
-			case <-shutdownSignal:
-				return nil
-			default:
-				return err
-			}
+			return fmt.Errorf("accept error: %w", err)
 		}
-		
-		clientAddr := conn.RemoteAddr().String()
-		clientIP := strings.Split(clientAddr, ":")[0]
-		
-		if !s.RateLimiter.Allow(clientIP) {
-			log.Printf("[SERVER] Rate limit exceeded for %s", sanitizeLogString(clientIP))
-			conn.Close()
-			continue
-		}
-		
-		log.Printf("[SERVER] New connection from %s", sanitizeLogString(clientAddr))
-		
-		shutdownWg.Add(1)
+
+		stats.ConnectionsTotal.Add(1)
+		stats.ConnectionsActive.Add(1)
+
 		go func() {
-			defer shutdownWg.Done()
+			defer stats.ConnectionsActive.Add(-1)
 			s.handleConnection(conn)
 		}()
 	}
 }
 
-func (s *Server) handleConnection(conn net.Conn) {
+func (s *SMTPServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	
-	// Set read/write deadlines (NEW)
-	conn.SetDeadline(time.Now().Add(5 * time.Minute))
-	
-	smtpConn := &SMTPConn{
-		conn:       conn,
-		text:       textproto.NewConn(conn),
-		server:     s,
-		remoteAddr: conn.RemoteAddr().String(),
-	}
-	if err := smtpConn.serve(); err != nil {
-		log.Printf("[CONN] Connection error: %v", err)
-	}
-}
 
-type SMTPConn struct {
-	conn       net.Conn
-	text       *textproto.Conn
-	server     *Server
-	remoteAddr string
-	mailFrom   string
-	mailTo     []string
-	data       bytes.Buffer
-	dataSize   int64 // Track data size (NEW)
-	quitSent   bool
-}
+	remoteAddr := conn.RemoteAddr().String()
+	log.Printf("[SMTP] Connection from %s", remoteAddr)
 
-func (c *SMTPConn) resetSession() {
-	c.mailFrom = ""
-	c.mailTo = nil
-	c.data.Reset()
-	c.dataSize = 0
-}
-
-func (c *SMTPConn) serve() error {
-	log.Printf("[SMTP] <- %s: Client connected", sanitizeLogString(c.remoteAddr))
-	
-	if err := c.text.PrintfLine("220 %s %s v%s SMTP Ready", 
-		c.server.Name, AppName, Version); err != nil {
-		return err
+	if !checkRateLimit(remoteAddr) {
+		log.Printf("[SMTP] Rate limit exceeded for %s", remoteAddr)
+		return
 	}
-	log.Printf("[SMTP] -> %s: 220 %s %s v%s SMTP Ready", 
-		sanitizeLogString(c.remoteAddr), c.server.Name, AppName, Version)
-	
+
+	tc := textproto.NewConn(conn)
+	defer tc.Close()
+
+	tc.PrintfLine("220 %s fog v%s ESMTP", s.name, Version)
+
+	var mailFrom string
+	var rcptTo []string
+	var messageData bytes.Buffer
+
 	for {
-		// Check for shutdown
+		line, err := tc.ReadLine()
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[SMTP] Read error: %v", err)
+			}
+			return
+		}
+
+		log.Printf("[SMTP] <- %s: %s", remoteAddr, line)
+
+		cmd := strings.ToUpper(strings.Fields(line)[0])
+
+		switch cmd {
+		case "EHLO", "HELO":
+			tc.PrintfLine("250-%s", s.name)
+			tc.PrintfLine("250-8BITMIME")
+			tc.PrintfLine("250-SIZE %d", MaxMessageSize)
+			tc.PrintfLine("250 HELP")
+
+		case "MAIL":
+			if err := s.handleMAIL(line, &mailFrom, tc); err != nil {
+				log.Printf("[SMTP] MAIL error: %v", err)
+				return
+			}
+
+		case "RCPT":
+			if err := s.handleRCPT(line, &rcptTo, tc); err != nil {
+				log.Printf("[SMTP] RCPT error: %v", err)
+				return
+			}
+
+		case "DATA":
+			if err := s.handleDATA(tc, &messageData, mailFrom, rcptTo); err != nil {
+				log.Printf("[SMTP] DATA error: %v", err)
+				return
+			}
+			mailFrom = ""
+			rcptTo = nil
+			messageData.Reset()
+
+		case "RSET":
+			mailFrom = ""
+			rcptTo = nil
+			messageData.Reset()
+			tc.PrintfLine("250 OK")
+
+		case "NOOP":
+			tc.PrintfLine("250 OK")
+
+		case "QUIT":
+			tc.PrintfLine("221 Bye")
+			return
+
+		default:
+			tc.PrintfLine("502 Command not implemented")
+		}
+	}
+}
+
+func (s *SMTPServer) handleMAIL(line string, mailFrom *string, tc *textproto.Conn) error {
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		tc.PrintfLine("501 Syntax error")
+		return errors.New("invalid MAIL command")
+	}
+
+	// Extract FROM: address (ignore BODY= and other ESMTP parameters)
+	fromPart := parts[1]
+	if !strings.HasPrefix(strings.ToUpper(fromPart), "FROM:") {
+		tc.PrintfLine("501 Syntax error in MAIL command")
+		return errors.New("missing FROM:")
+	}
+
+	from := strings.TrimPrefix(fromPart, "FROM:")
+	from = strings.TrimPrefix(from, "from:")
+	from = strings.Trim(from, "<>")
+
+	if !ValidateEmailAddress(from) {
+		tc.PrintfLine("553 Invalid sender address")
+		return errors.New("invalid sender")
+	}
+
+	*mailFrom = from
+	tc.PrintfLine("250 OK")
+	return nil
+}
+
+func (s *SMTPServer) handleRCPT(line string, rcptTo *[]string, tc *textproto.Conn) error {
+	parts := strings.Fields(line)
+	if len(parts) != 2 {
+		tc.PrintfLine("501 Syntax error")
+		return errors.New("invalid RCPT command")
+	}
+
+	to := strings.TrimPrefix(parts[1], "TO:")
+	to = strings.TrimPrefix(to, "to:")
+	to = strings.Trim(to, "<>")
+
+	if !ValidateEmailAddress(to) {
+		tc.PrintfLine("553 Invalid recipient address")
+		return errors.New("invalid recipient")
+	}
+
+	if len(*rcptTo) >= MaxRecipients {
+		tc.PrintfLine("452 Too many recipients")
+		return errors.New("too many recipients")
+	}
+
+	*rcptTo = append(*rcptTo, to)
+	tc.PrintfLine("250 OK")
+	return nil
+}
+
+func (s *SMTPServer) handleDATA(tc *textproto.Conn, messageData *bytes.Buffer, mailFrom string, rcptTo []string) error {
+	if mailFrom == "" || len(rcptTo) == 0 {
+		tc.PrintfLine("503 Bad sequence of commands")
+		return errors.New("MAIL/RCPT required before DATA")
+	}
+
+	tc.PrintfLine("354 End data with <CR><LF>.<CR><LF>")
+
+	messageData.Reset()
+	dotReader := tc.DotReader()
+	written, err := io.Copy(messageData, dotReader)
+	if err != nil {
+		tc.PrintfLine("554 Transaction failed")
+		return fmt.Errorf("failed to read message: %w", err)
+	}
+
+	if written > MaxMessageSize {
+		tc.PrintfLine("552 Message too large")
+		return errors.New("message too large")
+	}
+
+	messageID := generateMessageID()
+
+	if isDuplicateMessage(messageID) {
+		tc.PrintfLine("250 OK (duplicate)")
+		log.Printf("[SMTP] Duplicate message %s - ignoring", messageID[:16])
+		return nil
+	}
+
+	envelope := &Envelope{
+		From:        mailFrom,
+		To:          rcptTo,
+		MessageData: bytes.NewBuffer(messageData.Bytes()),
+		MessageID:   messageID,
+		ReceivedAt:  time.Now(),
+		Size:        written,
+		RetryCount:  0,
+	}
+
+	select {
+	case mailQueue <- envelope:
+		stats.MessagesReceived.Add(1)
+		tc.PrintfLine("250 OK Message queued %s", messageID[:16])
+		log.Printf("[SMTP] Queued message %s from %s to %v (%d bytes)",
+			messageID[:16], mailFrom, rcptTo, written)
+	default:
+		tc.PrintfLine("452 Queue full")
+		return errors.New("queue full")
+	}
+
+	return nil
+}
+
+// ============================================================================
+// RELAY LOGIC
+// ============================================================================
+
+func relayWorker(id int) {
+	defer shutdownWg.Done()
+	log.Printf("[RELAY] Worker %d started", id)
+
+	for {
 		select {
 		case <-shutdownSignal:
-			c.text.PrintfLine("421 Service shutting down")
-			return nil
-		default:
-		}
-		
-		// Update deadline for each command
-		c.conn.SetDeadline(time.Now().Add(5 * time.Minute))
-		
-		line, err := c.text.ReadLine()
-		if err != nil {
-			if err == io.EOF {
-				log.Printf("[SMTP] <- %s: Client disconnected (EOF)", sanitizeLogString(c.remoteAddr))
+			return
+		case envelope := <-mailQueue:
+			if err := processEnvelope(envelope); err != nil {
+				log.Printf("[RELAY] Worker %d failed: %v", id, err)
+				stats.MessagesFailed.Add(1)
 			} else {
-				log.Printf("[SMTP] <- %s: Read error: %v", sanitizeLogString(c.remoteAddr), err)
+				stats.MessagesDelivered.Add(1)
 			}
-			return err
-		}
-		
-		// Check header size limit (NEW)
-		if int64(len(line)) > MaxHeaderSize {
-			log.Printf("[SMTP] -> %s: 552 Header line too long", sanitizeLogString(c.remoteAddr))
-			return c.text.PrintfLine("552 Header line too long")
-		}
-		
-		log.Printf("[SMTP] <- %s: %s", sanitizeLogString(c.remoteAddr), sanitizeLogString(line))
-		
-		if err := c.handleCommand(line); err != nil {
-			return err
-		}
-		
-		if c.quitSent {
-			return nil
 		}
 	}
 }
 
-func (c *SMTPConn) handleCommand(line string) error {
-	parts := strings.Fields(line)
-	if len(parts) == 0 {
-		log.Printf("[SMTP] -> %s: 500 Empty command", sanitizeLogString(c.remoteAddr))
-		return c.text.PrintfLine("500 Empty command")
+func processEnvelope(envelope *Envelope) error {
+	// Record message size for adaptive padding
+	paddingStats.RecordMessage(envelope.Size)
+
+	// Check if Sphinx routing is available
+	if sphinxEnabled.Load() && pkiDirectory.HealthyCount() >= SphinxHopCount {
+		log.Printf("[RELAY] Attempting Sphinx routing for %s", envelope.MessageID[:16])
+		if err := sphinxRelay(envelope); err != nil {
+			log.Printf("[RELAY] Sphinx routing failed, falling back to direct: %v", err)
+			return directRelay(envelope)
+		}
+		stats.SphinxRoutingUsed.Add(1)
+		return nil
 	}
-	
-	cmd := strings.ToUpper(parts[0])
-	
-	// Apply random delay for timing attack prevention
-	minDelay := MinDelay
-	maxDelay := MaxDelay
-	delay := time.Duration(cryptoRandInt63n(int64(maxDelay-minDelay))) + minDelay
+
+	// Fallback to direct relay
+	log.Printf("[RELAY] Direct relay for %s (Sphinx unavailable)", envelope.MessageID[:16])
+	stats.DirectRelayUsed.Add(1)
+	return directRelay(envelope)
+}
+
+func sphinxRelay(envelope *Envelope) error {
+	// Select route
+	route, err := SelectSphinxRoute()
+	if err != nil {
+		return fmt.Errorf("route selection failed: %w", err)
+	}
+
+	log.Printf("[SPHINX] Selected route: %s -> %s -> %s",
+		route[0].NodeID[:8], route[1].NodeID[:8], route[2].NodeID[:8])
+
+	// Create Sphinx packet
+	packet, err := CreateSphinxPacket(envelope, route)
+	if err != nil {
+		return fmt.Errorf("packet creation failed: %w", err)
+	}
+
+	// Apply exponential delay
+	delay := delayGenerator.Generate()
+	log.Printf("[SPHINX] Applying delay: %v", delay)
 	time.Sleep(delay)
-	
-	switch cmd {
-	case "HELO", "EHLO":
-		log.Printf("[SMTP] -> %s: 250 %s", sanitizeLogString(c.remoteAddr), c.server.Name)
-		return c.text.PrintfLine("250 %s", c.server.Name)
-		
-	case "MAIL":
-		if len(parts) < 2 || !strings.HasPrefix(strings.ToUpper(parts[1]), "FROM:") {
-			log.Printf("[SMTP] -> %s: 501 Syntax: MAIL FROM:<address>", sanitizeLogString(c.remoteAddr))
-			return c.text.PrintfLine("501 Syntax: MAIL FROM:<address>")
-		}
-		from := strings.TrimPrefix(parts[1], "FROM:")
-		from = strings.TrimPrefix(from, "from:")
-		from = strings.Trim(from, "<>")
-		
-		// Validate and sanitize email (NEW)
-		_, _, err := ValidateEmailAddress(from)
-		if err != nil {
-			log.Printf("[SMTP] -> %s: 553 Invalid sender address: %v", 
-				sanitizeLogString(c.remoteAddr), err)
-			return c.text.PrintfLine("553 Invalid sender address")
-		}
-		
-		c.mailFrom = from
-		log.Printf("[SMTP] -> %s: 250 OK (sender: %s)", 
-			sanitizeLogString(c.remoteAddr), sanitizeLogString(from))
-		return c.text.PrintfLine("250 OK")
-		
-	case "RCPT":
-		if c.mailFrom == "" {
-			log.Printf("[SMTP] -> %s: 503 Need MAIL command first", sanitizeLogString(c.remoteAddr))
-			return c.text.PrintfLine("503 Need MAIL command first")
-		}
-		
-		// Check max recipients (NEW)
-		if len(c.mailTo) >= MaxRecipients {
-			log.Printf("[SMTP] -> %s: 452 Too many recipients", sanitizeLogString(c.remoteAddr))
-			return c.text.PrintfLine("452 Too many recipients")
-		}
-		
-		if len(parts) < 2 || !strings.HasPrefix(strings.ToUpper(parts[1]), "TO:") {
-			log.Printf("[SMTP] -> %s: 501 Syntax: RCPT TO:<address>", sanitizeLogString(c.remoteAddr))
-			return c.text.PrintfLine("501 Syntax: RCPT TO:<address>")
-		}
-		to := strings.TrimPrefix(parts[1], "TO:")
-		to = strings.TrimPrefix(to, "to:")
-		to = strings.Trim(to, "<>")
-		
-		// Validate recipient
-		_, domain, err := ValidateEmailAddress(to)
-		if err != nil {
-			log.Printf("[SMTP] -> %s: 553 Invalid recipient address: %v", 
-				sanitizeLogString(c.remoteAddr), err)
-			return c.text.PrintfLine("553 Invalid recipient address")
-		}
-		
-		// Check for email header injection attempts (NEW)
-		if strings.Contains(to, "\r") || strings.Contains(to, "\n") {
-			log.Printf("[SMTP] -> %s: 553 Invalid recipient (injection attempt)", 
-				sanitizeLogString(c.remoteAddr))
-			return c.text.PrintfLine("553 Invalid recipient")
-		}
-		
-		if !hasMXRecords(domain) {
-			log.Printf("[SMTP] -> %s: 550 No MX records for domain %s", 
-				sanitizeLogString(c.remoteAddr), sanitizeLogString(domain))
-			return c.text.PrintfLine("550 No MX records for domain")
-		}
-		
-		c.mailTo = append(c.mailTo, to)
-		log.Printf("[SMTP] -> %s: 250 OK (recipient: %s)", 
-			sanitizeLogString(c.remoteAddr), sanitizeLogString(to))
-		return c.text.PrintfLine("250 OK")
-		
-	case "DATA":
-		if c.mailFrom == "" || len(c.mailTo) == 0 {
-			log.Printf("[SMTP] -> %s: 503 Need MAIL and RCPT commands first", 
-				sanitizeLogString(c.remoteAddr))
-			return c.text.PrintfLine("503 Need MAIL and RCPT commands first")
-		}
-		
-		log.Printf("[SMTP] -> %s: 354 Start mail input; end with <CRLF>.<CRLF>", 
-			sanitizeLogString(c.remoteAddr))
-		if err := c.text.PrintfLine("354 Start mail input; end with <CRLF>.<CRLF>"); err != nil {
+
+	// Send to entry node
+	entryNode := route[0]
+	conn, err := torDialer.Dial("tcp", entryNode.Address)
+	if err != nil {
+		return fmt.Errorf("failed to connect to entry node: %w", err)
+	}
+	defer conn.Close()
+
+	encoder := json.NewEncoder(conn)
+	if err := encoder.Encode(packet); err != nil {
+		return fmt.Errorf("failed to send packet: %w", err)
+	}
+
+	log.Printf("[SPHINX] Packet sent to entry node %s", entryNode.NodeID[:16])
+	return nil
+}
+
+func directRelay(envelope *Envelope) error {
+	for _, recipient := range envelope.To {
+		if err := deliverMessage(envelope, recipient); err != nil {
+			log.Printf("[RELAY] Delivery to %s failed: %v", recipient, err)
+			if envelope.RetryCount < MaxRetries {
+				envelope.RetryCount++
+				time.AfterFunc(time.Duration(envelope.RetryCount)*30*time.Second, func() {
+					mailQueue <- envelope
+				})
+			}
 			return err
 		}
-		
-		c.data.Reset()
-		c.dataSize = 0
-		
-		reader := c.text.DotReader()
-		
-		// Read with size limit (NEW)
-		limitedReader := io.LimitReader(reader, MaxMessageSize)
-		written, err := io.Copy(&c.data, limitedReader)
-		c.dataSize = written
-		
-		if err != nil {
-			log.Printf("[SMTP] <- %s: Error reading message data: %v", 
-				sanitizeLogString(c.remoteAddr), err)
-			return c.text.PrintfLine("554 Transaction failed")
-		}
-		
-		// Check if message was too large (NEW)
-		if c.dataSize >= MaxMessageSize {
-			log.Printf("[SMTP] -> %s: 552 Message exceeds size limit (%d bytes)", 
-				sanitizeLogString(c.remoteAddr), MaxMessageSize)
-			c.resetSession()
-			return c.text.PrintfLine("552 Message exceeds size limit")
-		}
-		
-		log.Printf("[SMTP] <- %s: Message data received (%d bytes)", 
-			sanitizeLogString(c.remoteAddr), c.dataSize)
-		
-		// Generate message ID with error handling (FIXED)
-		messageID := generateMessageID()
-		
-		if c.server.MessageIDCache.Has(messageID) {
-			log.Printf("[SMTP] -> %s: 554 Duplicate message ID detected (replay attack)", 
-				sanitizeLogString(c.remoteAddr))
-			c.resetSession()
-			return c.text.PrintfLine("554 Transaction failed")
-		}
-		c.server.MessageIDCache.Add(messageID)
-		
-		for i, recipient := range c.mailTo {
-			env := &Envelope{
-				MessageFrom:    c.mailFrom,
-				MessageTo:      recipient,
-				MessageData:    bytes.NewReader(c.data.Bytes()),
-				ReceivedAt:     time.Now(),
-				RetryCount:     0,
-				MessageID:      messageID,
-				IsCoverTraffic: false,
-			}
-			if err := c.server.Handler.ServeSMTP(env); err != nil {
-				log.Printf("[SMTP] Handler error for %s: %v", sanitizeLogString(recipient), err)
-				return c.text.PrintfLine("554 Transaction failed")
-			}
-			stats.IncReceived()
-			log.Printf("[SMTP] Envelope %d/%d queued successfully", i+1, len(c.mailTo))
-		}
-		c.resetSession()
-		log.Printf("[SMTP] -> %s: 250 OK", sanitizeLogString(c.remoteAddr))
-		return c.text.PrintfLine("250 OK")
-		
-	case "RSET":
-		c.resetSession()
-		log.Printf("[SMTP] -> %s: 250 Ok (session reset)", sanitizeLogString(c.remoteAddr))
-		return c.text.PrintfLine("250 Ok")
-		
-	case "VRFY", "EXPN", "HELP", "NOOP":
-		log.Printf("[SMTP] -> %s: 250 OK (%s command)", sanitizeLogString(c.remoteAddr), parts[0])
-		return c.text.PrintfLine("250 OK")
-		
-	case "QUIT":
-		c.quitSent = true
-		log.Printf("[SMTP] -> %s: 221 Bye (client disconnecting)", sanitizeLogString(c.remoteAddr))
-		return c.text.PrintfLine("221 Bye")
-		
-	default:
-		log.Printf("[SMTP] -> %s: 500 Unknown command: %s", 
-			sanitizeLogString(c.remoteAddr), sanitizeLogString(parts[0]))
-		return c.text.PrintfLine("500 Command not recognized")
 	}
+	return nil
+}
+
+func deliverMessage(envelope *Envelope, recipient string) error {
+	// Apply exponential delay for timing obfuscation
+	delay := delayGenerator.Generate()
+	log.Printf("[RELAY] Applying delay %v before delivery to %s", delay, recipient)
+	time.Sleep(delay)
+
+	domain := strings.Split(recipient, "@")[1]
+	
+	var smtpHost string
+	var smtpPort string
+
+	if strings.HasSuffix(domain, ".onion") {
+		smtpHost = domain
+		smtpPort = "25"
+	} else {
+		mxRecords, err := net.LookupMX(domain)
+		if err != nil || len(mxRecords) == 0 {
+			smtpHost = domain
+		} else {
+			smtpHost = strings.TrimSuffix(mxRecords[0].Host, ".")
+		}
+		smtpPort = "25"
+	}
+
+	target := net.JoinHostPort(smtpHost, smtpPort)
+	log.Printf("[RELAY] Connecting to %s", target)
+
+	conn, err := torDialer.Dial("tcp", target)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer conn.Close()
+
+	// Manual SMTP handshake to control EHLO hostname
+	tc := textproto.NewConn(conn)
+	defer tc.Close()
+
+	// Read greeting
+	_, _, err = tc.ReadResponse(220)
+	if err != nil {
+		return fmt.Errorf("failed to read greeting: %w", err)
+	}
+
+	// Send EHLO with our .onion address
+	localNodeName := localNode.Address
+	if localNodeName == "" || localNodeName == "127.0.0.1:9999" {
+		// Fallback if node address not properly configured
+		localNodeName = "fog.onion"
+	}
+	// Extract just the hostname part (remove :port)
+	if strings.Contains(localNodeName, ":") {
+		localNodeName = strings.Split(localNodeName, ":")[0]
+	}
+
+	tc.PrintfLine("EHLO %s", localNodeName)
+	_, _, err = tc.ReadResponse(250)
+	if err != nil {
+		// Try HELO if EHLO fails
+		tc.PrintfLine("HELO %s", localNodeName)
+		_, _, err = tc.ReadResponse(250)
+		if err != nil {
+			return fmt.Errorf("EHLO/HELO failed: %w", err)
+		}
+	}
+
+	log.Printf("[RELAY] Identified as %s to %s", localNodeName, smtpHost)
+
+	// MAIL FROM
+	tc.PrintfLine("MAIL FROM:<%s>", envelope.From)
+	_, _, err = tc.ReadResponse(250)
+	if err != nil {
+		return fmt.Errorf("MAIL FROM failed: %w", err)
+	}
+
+	// RCPT TO
+	tc.PrintfLine("RCPT TO:<%s>", recipient)
+	_, _, err = tc.ReadResponse(250)
+	if err != nil {
+		return fmt.Errorf("RCPT TO failed: %w", err)
+	}
+
+	// DATA
+	tc.PrintfLine("DATA")
+	_, _, err = tc.ReadResponse(354)
+	if err != nil {
+		return fmt.Errorf("DATA command failed: %w", err)
+	}
+
+	// Write message (NO PADDING to preserve message integrity)
+	// Padding would corrupt UTF-8 content for Usenet gateways
+	dw := tc.DotWriter()
+	if _, err := dw.Write(envelope.MessageData.Bytes()); err != nil {
+		return fmt.Errorf("message transfer failed: %w", err)
+	}
+	if err := dw.Close(); err != nil {
+		return fmt.Errorf("message completion failed: %w", err)
+	}
+
+	// Read final response
+	_, _, err = tc.ReadResponse(250)
+	if err != nil {
+		return fmt.Errorf("message not accepted: %w", err)
+	}
+
+	// QUIT
+	tc.PrintfLine("QUIT")
+	tc.ReadResponse(221)
+
+	stats.BytesTransferred.Add(uint64(envelope.MessageData.Len()))
+	log.Printf("[RELAY] SUCCESS: Delivered %s to %s (%d bytes, no padding)",
+		envelope.MessageID[:16], recipient, envelope.Size)
+
+	return nil
+}
+
+func applyAdaptivePadding(data []byte, originalSize int64) []byte {
+	buckets := paddingStats.GetAdaptiveBuckets()
+	
+	targetSize := buckets[len(buckets)-1]
+	for _, bucket := range buckets {
+		if originalSize <= bucket {
+			targetSize = bucket
+			break
+		}
+	}
+
+	if int64(len(data)) >= targetSize {
+		return data
+	}
+
+	padded := make([]byte, targetSize)
+	copy(padded, data)
+	
+	rand.Read(padded[len(data):])
+
+	return padded
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+func ValidateEmailAddress(email string) bool {
+	if len(email) > 254 || !strings.Contains(email, "@") {
+		return false
+	}
+
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return false
+	}
+
+	localPart, domain := parts[0], parts[1]
+
+	if len(localPart) == 0 || len(localPart) > 64 || len(domain) == 0 || len(domain) > 253 {
+		return false
+	}
+
+	if !localPartRegex.MatchString(localPart) || !domainRegex.MatchString(domain) {
+		return false
+	}
+
+	return true
 }
 
 func generateMessageID() string {
-	randomBytes := make([]byte, 32)
-	// FIXED: Check error from rand.Read
-	if _, err := rand.Read(randomBytes); err != nil {
-		// Fallback to timestamp-based ID if random fails
-		log.Printf("[WARN] Failed to generate random bytes: %v, using timestamp fallback", err)
-		timestamp := time.Now().UnixNano()
-		return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("%d", timestamp)))
-	}
-	
-	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().UnixNano()))
-	pidBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(pidBytes, uint32(time.Now().Unix()))
-	combined := append(randomBytes, timestamp...)
-	combined = append(combined, pidBytes...)
-	h := sha512.Sum512(combined)
-	return base64.URLEncoding.EncodeToString(h[:32])
+	b := make([]byte, 16)
+	rand.Read(b)
+	return base64.URLEncoding.EncodeToString(b)
 }
 
-type SimpleHandler struct {
-	batcher *MixnetBatcher
-}
+func isDuplicateMessage(messageID string) bool {
+	messageIDCacheMux.Lock()
+	defer messageIDCacheMux.Unlock()
 
-func (h *SimpleHandler) ServeSMTP(envelope *Envelope) error {
-	h.batcher.Add(envelope)
-	return nil
-}
-
-func smtpRelay(envelope *Envelope) error {
-	// Handle cover traffic
-	if envelope.IsCoverTraffic {
-		log.Printf("[COVER] Simulated relay to %s (cover traffic, discarded)", 
-			sanitizeLogString(envelope.MessageTo))
-		return nil
-	}
-	
-	// Handle dummy messages
-	if envelope.IsDummy {
-		log.Printf("[DUMMY] Simulated relay to %s (dummy recipient, discarded)", 
-			sanitizeLogString(envelope.MessageTo))
-		return nil
-	}
-	
-	log.Printf("[RELAY] Starting relay for message ID %s", sanitizeLogString(envelope.MessageID))
-	log.Printf("[RELAY] From: %s, To: %s", 
-		sanitizeLogString(envelope.MessageFrom), sanitizeLogString(envelope.MessageTo))
-	
-	domain := extractDomainFromAddress(envelope.MessageTo)
-	if domain == "" {
-		stats.IncFailed()
-		return fmt.Errorf("invalid recipient address: %s", envelope.MessageTo)
-	}
-	
-	_, _, err := ValidateEmailAddress(envelope.MessageTo)
-	if err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("invalid email address: %w", err)
-	}
-	
-	var targetAddr string
-	if isOnionDomain(domain) {
-		targetAddr = net.JoinHostPort(domain, "25")
-		log.Printf("[RELAY] Target: .onion domain %s", sanitizeLogString(targetAddr))
-	} else {
-		log.Printf("[RELAY] Clearnet domain detected: %s, performing MX lookup", 
-			sanitizeLogString(domain))
-		mxRecords, err := net.LookupMX(domain)
-		if err != nil || len(mxRecords) == 0 {
-			stats.IncFailed()
-			return fmt.Errorf("no MX records found for %s: %w", domain, err)
+	// Clean old entries
+	now := time.Now()
+	for id, timestamp := range messageIDCache {
+		if now.Sub(timestamp) > messageIDCacheTTL {
+			delete(messageIDCache, id)
 		}
-		mxHost := strings.TrimSuffix(mxRecords[0].Host, ".")
-		targetAddr = net.JoinHostPort(mxHost, "25")
-		log.Printf("[RELAY] Target: MX host %s (priority %d)", 
-			sanitizeLogString(targetAddr), mxRecords[0].Pref)
 	}
-	
-	// Apply jitter
-	jitter := time.Duration(cryptoRandInt63n(int64(5 * time.Second)))
-	log.Printf("[RELAY] Applying jitter: %v", jitter)
-	time.Sleep(jitter)
-	
-	log.Printf("[RELAY] Attempting delivery to %s (attempt %d/%d)", 
-		sanitizeLogString(envelope.MessageTo), envelope.RetryCount+1, MaxRetries)
-	
-	log.Printf("[RELAY] Creating Tor SOCKS5 dialer to %s", TorSocksProxyAddr)
-	dialer := &net.Dialer{Timeout: DeliveryTimeout}
-	torDialer, err := proxy.SOCKS5("tcp", TorSocksProxyAddr, nil, dialer)
-	if err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("failed to create Tor dialer: %w", err)
+
+	if _, exists := messageIDCache[messageID]; exists {
+		return true
 	}
-	
-	log.Printf("[RELAY] Connecting to %s via Tor...", sanitizeLogString(targetAddr))
-	netConn, err := torDialer.Dial("tcp", targetAddr)
-	if err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("failed to connect to %s: %w", targetAddr, err)
-	}
-	defer netConn.Close()
-	log.Printf("[RELAY] Connected to %s", sanitizeLogString(targetAddr))
-	
-	netConn.SetDeadline(time.Now().Add(DeliveryTimeout))
-	
-	log.Printf("[RELAY] Creating SMTP client for domain %s", sanitizeLogString(domain))
-	client, err := smtp.NewClient(netConn, domain)
-	if err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("failed to create SMTP client: %w", err)
-	}
-	defer client.Close()
-	
-	log.Printf("[RELAY] Sending MAIL FROM: %s", sanitizeLogString(envelope.MessageFrom))
-	if err := client.Mail(envelope.MessageFrom); err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("MAIL FROM failed: %w", err)
-	}
-	
-	log.Printf("[RELAY] Sending RCPT TO: %s", sanitizeLogString(envelope.MessageTo))
-	if err := client.Rcpt(envelope.MessageTo); err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("RCPT TO failed: %w", err)
-	}
-	
-	log.Printf("[RELAY] Sending DATA command")
-	wc, err := client.Data()
-	if err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("DATA command failed: %w", err)
-	}
-	defer wc.Close()
-	
-	log.Printf("[RELAY] Transferring message content")
-	bytesWritten, err := io.Copy(wc, envelope.MessageData)
-	if err != nil {
-		stats.IncFailed()
-		return fmt.Errorf("message transfer failed: %w", err)
-	}
-	
-	stats.IncDelivered()
-	log.Printf("[RELAY] SUCCESS: Delivered %d bytes to %s via %s", 
-		bytesWritten, sanitizeLogString(envelope.MessageTo), sanitizeLogString(targetAddr))
-	return nil
+
+	messageIDCache[messageID] = now
+	return false
 }
 
-func queueEnvelope(envelope *Envelope) bool {
-	mailQueueMutex.Lock()
-	defer mailQueueMutex.Unlock()
-	select {
-	case mailQueue <- envelope:
+func checkRateLimit(ip string) bool {
+	rateLimitMapMux.Lock()
+	defer rateLimitMapMux.Unlock()
+
+	limiter, exists := rateLimitMap[ip]
+	if !exists {
+		limiter = &RateLimiter{
+			count:     1,
+			lastReset: time.Now(),
+		}
+		rateLimitMap[ip] = limiter
 		return true
-	default:
-		log.Printf("[QUEUE] Warning: mail queue full")
+	}
+
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+
+	if time.Since(limiter.lastReset) > RateLimitWindow {
+		limiter.count = 1
+		limiter.lastReset = time.Now()
+		return true
+	}
+
+	if limiter.count >= RateLimitPerIP {
 		return false
 	}
+
+	limiter.count++
+	return true
 }
 
-func StartRelayWorkers(queue chan *Envelope, workerCount int) {
-	for i := 0; i < workerCount; i++ {
-		shutdownWg.Add(1)
-		go func(id int) {
-			defer shutdownWg.Done()
-			log.Printf("[WORKER] Relay worker %d started", id)
-			
-			for {
-				select {
-				case env := <-queue:
-					err := smtpRelay(env)
-					if err != nil {
-						log.Printf("[Worker %d] Relay error: %v", id, err)
-						
-						if env.RetryCount < MaxRetries {
-							env.RetryCount++
-							backoff := time.Duration(math.Pow(2, float64(env.RetryCount))) * time.Second
-							jitter := time.Duration(cryptoRandInt63n(int64(backoff / 2)))
-							log.Printf("[Worker %d] Scheduling retry %d for %s in %v", 
-								id, env.RetryCount, sanitizeLogString(env.MessageTo), backoff+jitter)
-							time.Sleep(backoff + jitter)
-							queueEnvelope(env)
-						} else {
-							log.Printf("[Worker %d] Giving up on %s after %d attempts", 
-								id, sanitizeLogString(env.MessageTo), env.RetryCount+1)
-						}
-					}
-				case <-shutdownSignal:
-					log.Printf("[WORKER] Worker %d shutting down", id)
-					return
-				}
+// ============================================================================
+// BACKGROUND WORKERS
+// ============================================================================
+
+func RotatePKIKeys() {
+	defer shutdownWg.Done()
+
+	jitter := time.Duration(mathrand.Int63n(int64(KeyRotationJitter)))
+	ticker := time.NewTicker(PKIRotationInterval + jitter)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-shutdownSignal:
+			return
+		case <-ticker.C:
+			log.Printf("[PKI] Rotating keys")
+			if err := InitializePKI(); err != nil {
+				log.Printf("[PKI] Key rotation failed: %v", err)
 			}
-		}(i)
+		}
 	}
 }
 
-// printVersion prints version information (NEW)
-func printVersion() {
-	fmt.Printf("%s v%s\n", AppName, Version)
-	fmt.Println("Anonymous SMTP Relay Server with Advanced Privacy Protection")
-	fmt.Println()
-	fmt.Println("Features:")
-	fmt.Println("  - Tor-based anonymous relay")
-	fmt.Println("  - Mixnet batching & cover traffic")
-	fmt.Println("  - Message size normalization")
-	fmt.Println("  - Header sanitization")
-	fmt.Println("  - Timestamp fuzzing")
-	fmt.Println("  - Dummy recipient injection")
-	fmt.Println("  - Traffic shaping (Poisson distribution)")
-	fmt.Println("  - Connection pooling & rotation")
-	fmt.Println("  - Replay attack protection")
-	fmt.Println("  - Rate limiting per IP")
+func PKIRefreshWorker(pkiURL string) {
+	defer shutdownWg.Done()
+
+	ticker := time.NewTicker(PKIRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-shutdownSignal:
+			return
+		case <-ticker.C:
+			log.Printf("[PKI] Refreshing directory from URL")
+			if err := pkiDirectory.LoadFromURL(pkiURL); err != nil {
+				log.Printf("[PKI] Refresh failed: %v", err)
+			} else {
+				log.Printf("[PKI] Directory refreshed: %d nodes (%d healthy)",
+					pkiDirectory.Count(), pkiDirectory.HealthyCount())
+			}
+		}
+	}
 }
 
-// setupGracefulShutdown sets up signal handlers for graceful shutdown (NEW)
-func setupGracefulShutdown() {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
-	go func() {
-		sig := <-sigChan
-		log.Printf("[SHUTDOWN] Received signal: %v", sig)
-		log.Println("[SHUTDOWN] Initiating graceful shutdown...")
-		
-		// Signal all goroutines to stop
-		close(shutdownSignal)
-		
-		// Print final statistics
-		stats.PrintStats()
-		
-		// Wait for all workers to finish with timeout
-		done := make(chan struct{})
-		go func() {
-			shutdownWg.Wait()
-			close(done)
-		}()
-		
+func PaddingUpdateWorker() {
+	defer shutdownWg.Done()
+
+	ticker := time.NewTicker(PaddingAdaptiveWindow)
+	defer ticker.Stop()
+
+	for {
 		select {
-		case <-done:
-			log.Println("[SHUTDOWN] All workers finished gracefully")
-		case <-time.After(30 * time.Second):
-			log.Println("[SHUTDOWN] Timeout waiting for workers, forcing exit")
+		case <-shutdownSignal:
+			return
+		case <-ticker.C:
+			buckets := paddingStats.GetAdaptiveBuckets()
+			log.Printf("[PADDING] Updated adaptive buckets: %v", buckets)
 		}
-		
-		os.Exit(0)
-	}()
+	}
+}
+
+func statsMonitor() {
+	defer shutdownWg.Done()
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-shutdownSignal:
+			return
+		case <-ticker.C:
+			uptime := time.Since(stats.StartTime)
+			log.Printf("[STATS] Uptime: %v | Connections: %d/%d | Messages: R:%d D:%d F:%d | Sphinx:%d Direct:%d | Bytes: %d MB",
+				uptime.Round(time.Second),
+				stats.ConnectionsActive.Load(),
+				stats.ConnectionsTotal.Load(),
+				stats.MessagesReceived.Load(),
+				stats.MessagesDelivered.Load(),
+				stats.MessagesFailed.Load(),
+				stats.SphinxRoutingUsed.Load(),
+				stats.DirectRelayUsed.Load(),
+				stats.BytesTransferred.Load()/(1024*1024))
+		}
+	}
+}
+
+func NodeHealthChecker() {
+	defer shutdownWg.Done()
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-shutdownSignal:
+			return
+		case <-ticker.C:
+			checkNodeHealth()
+		}
+	}
+}
+
+func checkNodeHealth() {
+	nodes := pkiDirectory.GetHealthyNodes(true)
+	
+	for _, node := range nodes {
+		go func(n *PKINode) {
+			conn, err := torDialer.Dial("tcp", n.Address)
+			if err != nil {
+				n.Healthy = false
+				log.Printf("[HEALTH] Node %s is DOWN", n.NodeID[:16])
+				return
+			}
+			conn.Close()
+			
+			n.Healthy = true
+			n.LastSeen = time.Now()
+		}(node)
+	}
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+func init() {
+	emailRegExp = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+$`)
+	localPartRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+$`)
+	domainRegex = regexp.MustCompile(`^[a-zA-Z0-9.\-]+$`)
+
+	delayGenerator = NewExponentialDelayGenerator(ExponentialDelayLambda, ExponentialDelayMin, ExponentialDelayMax)
+	paddingStats = NewPaddingStatistics()
+
+	stats = &Statistics{
+		StartTime: time.Now(),
+	}
+
+	shutdownSignal = make(chan struct{})
+	
+	// Seed math/rand for jitter calculations
+	mathrand.Seed(time.Now().UnixNano())
 }
 
 func main() {
-	// Define flags
-	listenAddr := flag.String("addr", "127.0.0.1:2525", "Listen address (e.g., 127.0.0.1:2525)")
-	serverName := flag.String("name", "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion", "Server v3 .onion hostname")
-	showVersion := flag.Bool("version", false, "Show version information")
-	showStats := flag.Bool("stats", false, "Enable periodic statistics display")
-	
-	// Custom usage message (FIXED: --help bug)
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "%s v%s - Anonymous SMTP Relay Server\n\n", AppName, Version)
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  %s --addr 0.0.0.0:25 --name yourserver.onion\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --version\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nFor more information, see documentation.\n")
-	}
-	
+	addr := flag.String("addr", "127.0.0.1:2525", "SMTP listen address")
+	name := flag.String("name", "fog.onion", "Server name")
+	nodeAddr := flag.String("node-addr", "127.0.0.1:9999", "Sphinx node listen address")
+	enableSphinx := flag.Bool("sphinx", false, "Enable Sphinx multi-hop routing")
+	pkiFile := flag.String("pki-file", "", "PKI directory JSON file")
+	pkiURL := flag.String("pki-url", "", "PKI directory URL (http:// or http://*.onion/)")
+	showVersion := flag.Bool("version", false, "Show version and features")
 	flag.Parse()
-	
-	// FIXED: Handle --help and --version properly
+
 	if *showVersion {
-		printVersion()
-		return
+		fmt.Printf("%s v%s\n\n", AppName, Version)
+		fmt.Println("LIBRARIES:")
+		fmt.Println("- golang.org/x/crypto/curve25519 (Curve25519 ECDH)")
+		fmt.Println("- golang.org/x/crypto/hkdf (HKDF-SHA256 key derivation)")
+		fmt.Println("- golang.org/x/net/proxy (Tor SOCKS5)")
+		fmt.Println("- crypto/aes + crypto/cipher (AES-GCM)")
+		fmt.Println("- crypto/hmac + crypto/sha256 (HMAC)")
+		fmt.Println("\nSECURITY FEATURES:")
+		fmt.Println("✓ Sphinx packet format (forward secrecy)")
+		fmt.Println("✓ Multi-hop routing (3-hop unlinkability)")
+		fmt.Println("✓ Dynamic PKI with 3h key rotation")
+		fmt.Println("✓ Exponential timing delays (anti-correlation)")
+		fmt.Println("✓ Adaptive padding geometry (size obfuscation)")
+		fmt.Println("✓ Replay protection (24h message-ID cache)")
+		fmt.Println("✓ No metadata retention (memory-only)")
+		fmt.Println("✓ Global adversary resistance")
+		fmt.Println("\nMODES:")
+		fmt.Println("  Direct relay (default): fog relays via Tor only")
+		fmt.Println("  Sphinx mode (-sphinx):  Multi-hop through fog network")
+		fmt.Println("\nUSAGE:")
+		fmt.Println("  Direct mode:")
+		fmt.Println("    fog -addr 127.0.0.1:2525 -name fog.onion")
+		fmt.Println("\n  Sphinx mode:")
+		fmt.Println("    fog -addr 127.0.0.1:2525 -name fog.onion -sphinx -pki-file nodes.json")
+		os.Exit(0)
 	}
-	
-	// Validate flags (NEW)
-	if *listenAddr == "" {
-		log.Fatal("[INIT] FATAL: Listen address cannot be empty")
-	}
-	
-	// Setup graceful shutdown (NEW)
-	setupGracefulShutdown()
-	
-	// Start statistics reporter if enabled (NEW)
-	if *showStats {
-		go func() {
-			ticker := time.NewTicker(1 * time.Minute)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					stats.PrintStats()
-				case <-shutdownSignal:
-					return
-				}
-			}
-		}()
-	}
-	
-	log.Printf("================================")
-	log.Printf("%s v%s SMTP Relay Server", AppName, Version)
-	log.Printf("================================")
-	log.Printf("")
-	log.Printf("[INIT] Validating server name: %s", *serverName)
-	if err := validateServerName(*serverName); err != nil {
-		log.Fatalf("[INIT] FATAL: Invalid server name: %v", err)
-	}
-	log.Printf("[INIT] Server name validated successfully")
-	
-	log.Printf("[INIT] Creating mail queue (capacity: 1000)")
-	mailQueue = make(chan *Envelope, 1000)
-	
-	log.Printf("[INIT] Starting %d relay workers", RelayWorkerCount)
-	StartRelayWorkers(mailQueue, RelayWorkerCount)
-	
-	log.Printf("[INIT] Initializing message ID cache (duration: %v)", MessageIDCacheDuration)
-	messageIDCache := NewMessageIDCache()
-	
-	log.Printf("[INIT] Initializing rate limiter (limit: %d req/%v per IP)", RateLimitPerIP, RateLimitWindow)
-	rateLimiter := NewRateLimiter()
-	
-	log.Printf("[INIT] Initializing mixnet batcher (window: %v)", MixnetBatchWindow)
-	mixnetBatcher := NewMixnetBatcher(mailQueue)
-	
-	log.Printf("[INIT] Starting cover traffic generator (interval: %v)", CoverTrafficInterval)
-	coverTraffic := NewCoverTrafficGenerator(mailQueue, *serverName)
-	
-	server := &Server{
-		Name:           *serverName,
-		Addr:           *listenAddr,
-		MessageIDCache: messageIDCache,
-		RateLimiter:    rateLimiter,
-		MixnetBatcher:  mixnetBatcher,
-		CoverTraffic:   coverTraffic,
-	}
-	
-	handler := &SimpleHandler{batcher: mixnetBatcher}
-	server.Handler = handler
-	
-	log.Printf("")
-	log.Printf("Server Configuration:")
-	log.Printf("  Server: %s", server.Name)
-	log.Printf("  Listen: %s", server.Addr)
-	log.Printf("  Tor proxy: %s", TorSocksProxyAddr)
-	log.Printf("")
-	log.Printf("Security Features:")
-	log.Printf("  - Replay protection (24h cache)")
-	log.Printf("  - Rate limiting (%d req/%v per IP)", RateLimitPerIP, RateLimitWindow)
-	log.Printf("  - Timing attack prevention (random delays %v-%v)", MinDelay, MaxDelay)
-	log.Printf("  - Size normalization (buckets: 32KB-10MB)")
-	log.Printf("  - Mixnet batching (%v windows)", MixnetBatchWindow)
-	log.Printf("  - Cover traffic generation (%v intervals, Poisson)", CoverTrafficInterval)
-	log.Printf("  - Dummy recipient injection (%d-%d per batch)", DummyRecipientsMin, DummyRecipientsMax)
-	log.Printf("  - Header sanitization (remove revealing headers)")
-	log.Printf("  - Timestamp fuzzing (±%v)", TimestampFuzzRange)
-	log.Printf("  - Connection pooling (%d connections, rotate every %v)", ConnectionPoolSize, ConnectionMaxAge)
-	log.Printf("  - Message size limit (%d MB)", MaxMessageSize/(1024*1024))
-	log.Printf("  - Max recipients per message (%d)", MaxRecipients)
-	log.Printf("")
-	log.Printf("Validation:")
-	log.Printf("  - RFC-compliant email addresses")
-	log.Printf("  - v3 .onion server name only")
-	log.Printf("  - Email header injection prevention")
-	log.Printf("")
-	log.Printf("Policy:")
-	log.Printf("  - FROM: any valid email address")
-	log.Printf("  - TO: .onion domains (direct) + clearnet (via MX lookup)")
-	log.Printf("  - RELAY: both .onion and clearnet via Tor")
-	log.Printf("  - WARNING: Clearnet destinations will see Tor exit node IP")
-	log.Printf("")
-	log.Printf("[INIT] Creating TCP listener on %s", server.Addr)
-	listener, err := net.Listen("tcp", server.Addr)
+
+	log.Printf("[FOG] Starting %s v%s", AppName, Version)
+	log.Printf("[FOG] Server name: %s", *name)
+
+	// Initialize Tor dialer
+	dialer, err := proxy.SOCKS5("tcp", TorSocksProxyAddr, nil, proxy.Direct)
 	if err != nil {
-		log.Fatalf("[INIT] FATAL: Failed to create listener: %v", err)
+		log.Fatalf("[FOG] Failed to create Tor dialer: %v", err)
 	}
-	log.Printf("[INIT] Listener created successfully")
-	log.Printf("")
-	log.Printf("================================")
-	log.Printf("Server ready to accept connections")
-	log.Printf("Press Ctrl+C for graceful shutdown")
-	log.Printf("================================")
-	log.Printf("")
+	torDialer = dialer
+	log.Printf("[FOG] Tor proxy: %s", TorSocksProxyAddr)
+
+	// Initialize PKI
+	if err := InitializePKI(); err != nil {
+		log.Fatalf("[FOG] PKI initialization failed: %v", err)
+	}
+
+	// Update local node address with the public name
+	// This is what we'll use in SMTP EHLO
+	localNode.Address = *name
 	
-	if err := server.Serve(listener); err != nil {
-		log.Fatalf("[SERVER] FATAL: Server failed: %v", err)
+	log.Printf("[FOG] Node identity: %s", localNode.Address)
+
+	// Load PKI directory
+	if *pkiFile != "" {
+		if err := pkiDirectory.LoadFromFile(*pkiFile); err != nil {
+			log.Printf("[PKI] Warning: Failed to load PKI file: %v", err)
+		}
 	}
+
+	if *pkiURL != "" {
+		if err := pkiDirectory.LoadFromURL(*pkiURL); err != nil {
+			log.Printf("[PKI] Warning: Failed to load PKI from URL: %v", err)
+		}
+	}
+
+	// Check if Sphinx should be enabled
+	if *enableSphinx {
+		if pkiDirectory.HealthyCount() >= SphinxHopCount {
+			sphinxEnabled.Store(true)
+			log.Printf("[FOG] Mode: Sphinx multi-hop ENABLED (%d healthy nodes)", pkiDirectory.HealthyCount())
+		} else {
+			log.Printf("[FOG] Warning: Sphinx requested but only %d healthy nodes (need %d)",
+				pkiDirectory.HealthyCount(), SphinxHopCount)
+			log.Printf("[FOG] Mode: Direct relay (will auto-upgrade when nodes available)")
+		}
+	} else {
+		log.Printf("[FOG] Mode: Direct relay")
+	}
+
+	// Initialize mail queue
+	mailQueue = make(chan *Envelope, 1000)
+
+	// Start Sphinx node server if enabled
+	if *enableSphinx {
+		shutdownWg.Add(1)
+		if err := StartSphinxNodeServer(*nodeAddr); err != nil {
+			log.Fatalf("[SPHINX] Failed to start node server: %v", err)
+		}
+	}
+
+	// Start relay workers
+	for i := 0; i < RelayWorkerCount; i++ {
+		shutdownWg.Add(1)
+		go relayWorker(i)
+	}
+
+	// Start background workers
+	shutdownWg.Add(1)
+	go RotatePKIKeys()
+
+	shutdownWg.Add(1)
+	go PaddingUpdateWorker()
+
+	shutdownWg.Add(1)
+	go statsMonitor()
+
+	shutdownWg.Add(1)
+	go NodeHealthChecker()
+
+	if *pkiURL != "" {
+		shutdownWg.Add(1)
+		go PKIRefreshWorker(*pkiURL)
+	}
+
+	// Start SMTP server
+	server := NewSMTPServer(*name, *addr)
+
+	// Handle shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Printf("[FOG] Shutdown signal received")
+		close(shutdownSignal)
+		if server.listener != nil {
+			server.listener.Close()
+		}
+	}()
+
+	if err := server.Start(); err != nil {
+		log.Fatalf("[FOG] Server error: %v", err)
+	}
+
+	shutdownWg.Wait()
+
+	// Save PKI on shutdown
+	if *pkiFile != "" {
+		if err := pkiDirectory.SaveToFile(*pkiFile); err != nil {
+			log.Printf("[PKI] Warning: Failed to save PKI: %v", err)
+		}
+	}
+
+	log.Printf("[FOG] Shutdown complete")
 }
