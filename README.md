@@ -9,7 +9,7 @@
 
 ⚠️ **IMPORTANT**: This project was previously known as `pluto2`. It has been completely rewritten and renamed to **fog** in version v0.9.
 
-🔗 **Repository**: https://github.com/YOUR_USERNAME/fog
+🔗 **Repository**: https://github.com/gabrix73/fog
 
 ---
 
