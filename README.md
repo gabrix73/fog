@@ -528,8 +528,6 @@ fog is designed for scenarios requiring maximum email privacy:
 
 ---
 
-<div align="center">
-
 **🌫️ fog v0.9 - Anonymous SMTP Relay Server 🌫️**
 
 *Stay Foggy. Stay Anonymous. Stay Safe.*
@@ -542,6 +540,6 @@ fog is designed for scenarios requiring maximum email privacy:
 
 Made with ❤️ for privacy
 
-</div>
+
 
 
