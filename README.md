@@ -73,7 +73,7 @@ sudo systemctl enable tor
 
 ```bash
 # Clone repository
-git clone https://github.com/YOUR_USERNAME/fog.git
+git clone https://github.com/gabrix73/fog.git
 cd fog
 
 # Install dependencies
@@ -121,15 +121,6 @@ This is a test message.
 .
 QUIT
 ```
-
----
-
-## 📖 Documentation
-
-- 📋 [**Complete Changelog**](FOG_v0.9_CHANGELOG.md) - All changes in v0.9
-- 🚀 [**Quick Start Guide**](QUICK_START.md) - Installation, configuration, testing
-- 🔄 [**pluto2 vs fog Comparison**](PLUTO2_vs_FOG_COMPARISON.md) - What changed and why
-- 🔧 [**GitHub Rename Guide**](GITHUB_RENAME_GUIDE.md) - How to update your local clone
 
 ---
 
@@ -203,8 +194,6 @@ All critical bugs from `pluto2` have been fixed:
 | **Production Ready** | ❌ | ✅ | ✅ |
 
 **Verdict**: fog v0.9 is an **essential upgrade** from pluto2.
-
-📖 See [full comparison](PLUTO2_vs_FOG_COMPARISON.md) for detailed analysis.
 
 ---
 
@@ -336,10 +325,6 @@ sudo netstat -tulpn | grep :25
 # If doesn't respond:
 ps aux | grep fog
 kill -9 [PID]
-```
-
-📖 See [QUICK_START.md](QUICK_START.md) for more troubleshooting.
-
 ---
 
 ## 🏗️ Architecture
@@ -429,7 +414,7 @@ Contributions are welcome! Here's how:
 
 ```bash
 # Clone your fork
-git clone https://github.com/YOUR_USERNAME/fog.git
+git clone https://github.com/gabrix73/fog.git
 cd fog
 
 # Install development dependencies
@@ -443,14 +428,6 @@ go build -o fog fog.go
 
 # Test
 ./fog --help
-```
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ---
 
 ## 🙏 Acknowledgments
@@ -465,14 +442,14 @@ fog v0.9 continues the mission with major improvements in privacy and security.
 
 ## 📞 Contact & Support
 
-- **Issues**: https://github.com/YOUR_USERNAME/fog/issues
-- **Discussions**: https://github.com/YOUR_USERNAME/fog/discussions
-- **Pull Requests**: https://github.com/YOUR_USERNAME/fog/pulls
+- **Issues**: https://github.com/gabrix73/fog/issues
+- **Discussions**: https://github.com/gabrix73/fog/discussions
+- **Pull Requests**: https://github.com/gabrix73/fog/pulls
 
 ### Security Issues
 
 For security vulnerabilities, please **DO NOT** open a public issue.  
-Instead, contact: [your-email@example.com]
+Instead, contact: [security@tcpreset.net]
 
 ---
 
@@ -498,15 +475,6 @@ Instead, contact: [your-email@example.com]
 - [ ] Kubernetes support
 - [ ] Message queueing to disk
 - [ ] Clustering support
-
----
-
-## 📊 Project Statistics
-
-![Lines of Code](https://img.shields.io/badge/Lines%20of%20Code-1630-blue)
-![Documentation](https://img.shields.io/badge/Documentation-Complete-green)
-![Privacy Rating](https://img.shields.io/badge/Privacy-⭐⭐⭐⭐⭐-brightgreen)
-![Security Rating](https://img.shields.io/badge/Security-⭐⭐⭐⭐⭐-brightgreen)
 
 ---
 
@@ -552,11 +520,11 @@ fog is designed for scenarios requiring maximum email privacy:
 
 ## 🎯 Quick Links
 
-- 📥 [Download Latest Release](https://github.com/YOUR_USERNAME/fog/releases/latest)
-- 📖 [Documentation](https://github.com/YOUR_USERNAME/fog/tree/main)
-- 🐛 [Report Bug](https://github.com/YOUR_USERNAME/fog/issues/new)
-- 💡 [Request Feature](https://github.com/YOUR_USERNAME/fog/issues/new)
-- 💬 [Discussions](https://github.com/YOUR_USERNAME/fog/discussions)
+- 📥 [Download Latest Release](https://github.com/gabrix73/fog/releases/latest)
+- 📖 [Documentation](https://github.com/gabrix73/fog/tree/main)
+- 🐛 [Report Bug](https://github.com/gabrix73/fog/issues/new)
+- 💡 [Request Feature](https://github.com/gabrix73/fog/issues/new)
+- 💬 [Discussions](https://github.com/gabrix73/fog/discussions)
 
 ---
 
@@ -568,9 +536,9 @@ fog is designed for scenarios requiring maximum email privacy:
 
 ⭐ **Star this repo if you find it useful!** ⭐
 
-[Report Bug](https://github.com/YOUR_USERNAME/fog/issues) · 
-[Request Feature](https://github.com/YOUR_USERNAME/fog/issues) · 
-[Documentation](https://github.com/YOUR_USERNAME/fog/tree/main)
+[Report Bug](https://github.com/gabrix73/fog/issues) · 
+[Request Feature](https://github.com/gabrix73/fog/issues) · 
+[Documentation](https://github.com/gabrix73/fog/tree/main)
 
 Made with ❤️ for privacy
 
