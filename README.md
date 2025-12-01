@@ -60,9 +60,8 @@ apt install tor golang-go
 ### 2. Create fog user and directories
 
 ```bash
-useradd -r -s /bin/false fog
-mkdir -p /var/lib/fog/fog-data
-chown fog:fog -R /var/lib/fog
+# groupadd -r fog
+# useradd -g fog -s /usr/sbin/nologin -r -m -d /var/lib/fog fog
 ```
 
 ### 3. Configure Tor Hidden Service
