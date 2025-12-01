@@ -1,545 +1,392 @@
-# 🌫️ fog v1.2.0
+# 🌫️ fog
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/Go-1.19+-00ADD8?logo=go)](https://golang.org/)
-[![Release](https://img.shields.io/github/v/release/YOUR_USERNAME/fog)](https://github.com/YOUR_USERNAME/fog/releases)
-[![Stars](https://img.shields.io/github/stars/YOUR_USERNAME/fog)](https://github.com/YOUR_USERNAME/fog/stargazers)
+**Anonymous SMTP Relay with Sphinx Mixnet over Tor**
 
-> **Anonymous SMTP Relay Server with Advanced Privacy Protection**
+fog is a privacy-focused SMTP relay that routes messages through a 3-hop Sphinx mixnet, providing strong anonymity guarantees against traffic analysis, timing attacks, and metadata correlation.
 
-⚠️ **IMPORTANT**: This project was previously known as `pluto2`. It has been completely rewritten and renamed to **fog** in version v0.9.
+## Features
 
-🔗 **Repository**: https://github.com/gabrix73/fog
+### Security
+- **Sphinx Mixnet**: 3-hop onion routing with layered encryption
+- **Curve25519 ECDH**: Key exchange with forward secrecy
+- **AES-256-GCM**: Authenticated encryption for all payloads
+- **Traffic Analysis Resistance**: Fixed-size packets (64KB), batch processing, random shuffling
+- **Timing Attack Resistance**: Cryptographically random delays (500ms-5s)
+- **Replay Protection**: 24-hour message ID cache
+- **Size Correlation Resistance**: Uniform packet sizes with random padding
+- **No Metadata Retention**: Memory-only processing, no persistent logs
 
----
-
-## 🌟 Features
-
-### 🔒 Maximum Privacy
-- **8 Advanced Anti-Tracking Techniques** implemented
-- Size normalization (impossible to fingerprint message sizes)
-- Timing protection (Poisson distribution + exponential jitter)
-- Dummy recipients injection (1-3 fake recipients per batch)
-- Header sanitization (removes X-Mailer, User-Agent, IPs)
-- Timestamp fuzzing (±2 hours random offset)
-- Connection pooling with rotation (prevents circuit fingerprinting)
-- Traffic shaping (natural patterns)
-- Message fragmentation support
-
-### 🛡️ Enterprise-Grade Security
-- DoS protection (message size limits: 10MB)
-- Rate limiting (per-IP protection)
-- Log injection prevention
-- Email header injection prevention
-- Input validation on all fields
-- Replay attack protection (24h cache)
-- Consistent timeouts on all I/O
-
-### 🌐 Tor Integration
+### Network
 - All traffic routed through Tor
-- Support for both .onion and clearnet destinations
-- Automatic MX lookup for clearnet
-- Connection pooling for efficiency
-- Circuit rotation every 10 minutes
+- Decentralized node discovery via shared PKI file
+- Health monitoring with automatic failover
+- Each node can be entry, middle, or exit
 
-### 🎯 Excellent UX
-- `--help` works correctly (bug fixed!)
-- `--version` shows version info
-- `--stats` for real-time monitoring
-- Graceful shutdown (Ctrl+C)
-- Clear error messages
-- Statistics tracking
+## Architecture
 
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-```bash
-# Install Go (1.19 or later)
-# Ubuntu/Debian:
-sudo apt install golang-go
-
-# Install Tor
-sudo apt install tor
-
-# Start Tor
-sudo systemctl start tor
-sudo systemctl enable tor
+```
+┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
+│  Client │────▶│  Entry  │────▶│  Middle │────▶│  Exit   │────▶ Destination
+│  SMTP   │     │  Node   │     │  Node   │     │  Node   │     (email/usenet)
+└─────────┘     └─────────┘     └─────────┘     └─────────┘
+                    │               │               │
+                    ▼               ▼               ▼
+              Encrypt L3      Decrypt L3      Decrypt L2
+              Encrypt L2      Forward L2      Decrypt L1
+              Encrypt L1      (shuffled)      Deliver
 ```
 
-### Installation
+Each node:
+- Receives Sphinx packets on port 9999
+- Accepts SMTP on port 2525 (entry point)
+- Decrypts one layer, applies random delay, forwards
+
+## Requirements
+
+- Linux (Debian/Ubuntu recommended)
+- Go 1.21+
+- Tor
+- Minimum 3 fog nodes for mixnet operation
+
+## Installation
+
+### 1. Install dependencies
 
 ```bash
-# Clone repository
-git clone https://github.com/gabrix73/fog.git
-cd fog
+apt update
+apt install tor golang-go
+```
 
-# Install dependencies
+### 2. Create fog user and directories
+
+```bash
+useradd -r -s /bin/false fog
+mkdir -p /var/lib/fog/fog-data
+chown fog:fog -R /var/lib/fog
+```
+
+### 3. Configure Tor Hidden Service
+
+Add to `/etc/tor/torrc`:
+
+```
+HiddenServiceDir /var/lib/tor/fog
+HiddenServicePort 2525 127.0.0.1:2525
+HiddenServicePort 9999 127.0.0.1:9999
+```
+
+Restart Tor and get your .onion address:
+
+```bash
+systemctl restart tor
+cat /var/lib/tor/fog/hostname
+# Example: 66ehoz4ir6beuovmgt4gbpdfpmy43iuouj36dylqvkwgyp2dwpcbvjqd.onion
+```
+
+### 4. Build fog
+
+```bash
+cd /var/lib/fog
+nano fog.go  # paste the fog source code
+
 go mod init fog
 go mod tidy
-go get golang.org/x/net/proxy
-
-# Build
-go build -o fog fog.go
-
-# Verify installation
-./fog --version
+go build -ldflags="-s -w" -trimpath -o fog
 ```
 
-### Basic Usage
+### 5. Export node info
 
 ```bash
-# Start server (test mode)
-./fog --addr 127.0.0.1:2525 --name abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion
-
-# Start server (production mode with statistics)
-./fog --addr 0.0.0.0:25 --name your-v3-onion-address.onion --stats
-
-# Show help
-./fog --help
-
-# Show version
-./fog --version
+./fog -export-node-info \
+    -name YOUR_ONION_ADDRESS.onion \
+    -short-name mynode
 ```
 
-### Test Connection
+This creates `nodes.json` with your node's public key.
+
+### 6. Create systemd service
+
+Create `/etc/systemd/system/fog.service`:
+
+```ini
+[Unit]
+Description=fog - Anonymous SMTP Relay with Sphinx Mixnet
+Documentation=https://github.com/gabrix73/fog
+After=network.target tor.service
+Wants=tor.service
+
+[Service]
+Type=simple
+User=fog
+Group=fog
+WorkingDirectory=/var/lib/fog
+
+ExecStart=/var/lib/fog/fog \
+    -name YOUR_ONION_ADDRESS.onion \
+    -short-name mynode \
+    -smtp 127.0.0.1:2525 \
+    -node 127.0.0.1:9999 \
+    -sphinx \
+    -pki-file /var/lib/fog/nodes.json \
+    -data-dir /var/lib/fog/fog-data \
+    -debug
+
+Restart=always
+RestartSec=10
+StartLimitInterval=200
+StartLimitBurst=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/fog/fog-data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelLogs=true
+ProtectHostname=true
+
+LimitNOFILE=65535
+LimitNPROC=512
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fog
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 7. Set permissions and start
 
 ```bash
-# In another terminal
-telnet localhost 2525
+chown fog:fog -R /var/lib/fog
+systemctl daemon-reload
+systemctl enable fog
+systemctl start fog
+```
 
-# SMTP commands:
-EHLO test.local
-MAIL FROM:<sender@example.com>
+### 8. Verify
+
+```bash
+systemctl status fog
+journalctl -u fog -f
+```
+
+You should see:
+```
+[FOG] Starting v2.0.1
+[PKI] Loaded 4 nodes from /var/lib/fog/nodes.json
+[HEALTH] Checking 3 nodes
+[HEALTH] node1 OK
+[HEALTH] node2 OK
+[HEALTH] node3 OK
+[HEALTH] Done. 3 nodes healthy
+```
+
+## Network Setup
+
+### Combining nodes.json
+
+Each operator exports their node info, then all nodes are combined into a single `nodes.json`:
+
+```json
+{
+  "version": "2.0.1",
+  "updated": "2025-12-01T00:00:00Z",
+  "nodes": [
+    {
+      "node_id": "8342eaab81017d33...",
+      "public_key": "pyva1yu+5SDFb7UzyB3ZhNtpoCEHaU/IewsDOBvg6n8=",
+      "address": "ej5dj774rkmfxvo3jexcmyotkq6bwgmr45dmwrbmk366lcvalnrgolad.onion:9999",
+      "name": "node1",
+      "version": "2.0.1"
+    },
+    {
+      "node_id": "340c546059a8c322...",
+      "public_key": "Ult6z/aOvrzB0+149wIDjuCSFVo8xF067yp/MFQLaHM=",
+      "address": "iycr4wfrdzieogdfeo7uxrj77w2vjlrhlrv3jg2ve62oe5aceqsqu7ad.onion:9999",
+      "name": "node2",
+      "version": "2.0.1"
+    },
+    {
+      "node_id": "c386967674709d76...",
+      "public_key": "mYeEtBhNUPQ4QTTUH0b3ngOSbvjK8ctR7kAz09cjb3g=",
+      "address": "66ehoz4ir6beuovmgt4gbpdfpmy43iuouj36dylqvkwgyp2dwpcbvjqd.onion:9999",
+      "name": "node3",
+      "version": "2.0.1"
+    },
+    {
+      "node_id": "ebc04620851a8a9b...",
+      "public_key": "z0iNumJks/5aZ1+Zys0NUwVk5VzYdEfyL//a6J5miwE=",
+      "address": "ejdrw3ka2mjhvsuz7uxjnzjircsdpoiu3a33g2xoywlafqetptjpqryd.onion:9999",
+      "name": "node4",
+      "version": "2.0.1"
+    }
+  ]
+}
+```
+
+Copy the same `nodes.json` to all nodes and restart.
+
+## Usage
+
+### Send email via SMTP
+
+```bash
+# Connect to any fog node
+telnet 127.0.0.1 2525
+
+EHLO client
+MAIL FROM:<anonymous@fog.local>
 RCPT TO:<recipient@example.com>
 DATA
-Subject: Test
+Subject: Test message
 
-This is a test message.
+Hello from fog mixnet!
 .
 QUIT
 ```
 
----
-
-## 🕵️ Privacy & Security Features
-
-fog v0.9 implements **8 advanced anti-tracking techniques**:
-
-| # | Technique | Description | Privacy Impact |
-|---|-----------|-------------|----------------|
-| 1 | **Traffic Shaping** | Poisson distribution for natural timing | ⭐⭐⭐⭐⭐ |
-| 2 | **Dummy Recipients** | 1-3 fake recipients per batch | ⭐⭐⭐⭐⭐ |
-| 3 | **Message Fragmentation** | Random-sized fragments support | ⭐⭐⭐⭐ |
-| 4 | **Header Sanitization** | Removes X-Mailer, User-Agent, IPs | ⭐⭐⭐⭐⭐ |
-| 5 | **Timestamp Fuzzing** | ±2 hours random offset | ⭐⭐⭐⭐ |
-| 6 | **Size Normalization** | Fixed bucket sizes (32KB-10MB) | ⭐⭐⭐⭐⭐ |
-| 7 | **Connection Pooling** | 5 persistent Tor connections | ⭐⭐⭐⭐ |
-| 8 | **Exponential Jitter** | Unpredictable inter-message delays | ⭐⭐⭐⭐⭐ |
-
-**Overall Privacy Level**: ⭐⭐⭐⭐⭐ (Maximum)
-
-### Protection Against
-
-✅ Size fingerprinting (via bucket normalization)  
-✅ Timing correlation (via Poisson + exponential jitter)  
-✅ Traffic analysis (via dummy recipients + cover traffic)  
-✅ Header leaking (via sanitization)  
-✅ Temporal correlation (via timestamp fuzzing)  
-✅ Circuit fingerprinting (via connection pooling)  
-✅ Replay attacks (via 24h message ID cache)  
-✅ Rate limiting bypass (via per-IP tracking)  
-✅ DoS attacks (via size + recipient limits)  
-✅ Log injection (via input sanitization)  
-✅ Email header injection (via CRLF validation)  
-
----
-
-## 🐛 Bug Fixes (v0.9)
-
-All critical bugs from `pluto2` have been fixed:
-
-| Bug | pluto2 | fog v0.9 |
-|-----|--------|----------|
-| `--help/-h` starts server anyway | ❌ | ✅ Fixed |
-| `extractDomainFromAddress()` missing | ❌ | ✅ Implemented |
-| Global variables not declared | ❌ | ✅ Declared |
-| `rand.Read()` without error handling | ❌ | ✅ Fixed |
-| No message size limits (DoS risk) | ❌ | ✅ Fixed (10MB) |
-| Log injection vulnerability | ❌ | ✅ Fixed |
-| No graceful shutdown | ❌ | ✅ Implemented |
-
----
-
-## 📊 Comparison: pluto2 vs fog v0.9
-
-| Feature | pluto2 | fog v0.9 | Improvement |
-|---------|--------|----------|-------------|
-| **Compilable** | ❌ | ✅ | 🔧 Critical |
-| **Critical Bugs** | 4 | 0 | 🔧 Critical |
-| **--help works** | ❌ | ✅ | 🔧 Critical |
-| **Message size limit** | ❌ | ✅ 10MB | 🔒 Security |
-| **Log injection prevention** | ❌ | ✅ | 🔒 Security |
-| **Privacy techniques** | 5 basic | 13 advanced | 🕵️ Privacy |
-| **Size normalization** | ⚠️ Basic padding | ✅ Bucket-based | 🕵️ Privacy |
-| **Dummy recipients** | ❌ | ✅ 1-3 per batch | 🕵️ Privacy |
-| **Header sanitization** | ❌ | ✅ Complete | 🕵️ Privacy |
-| **Connection pooling** | ❌ | ✅ 5 connections | 🕵️ Privacy |
-| **Graceful shutdown** | ❌ | ✅ Ctrl+C | 🎯 UX |
-| **Statistics** | ❌ | ✅ --stats flag | 🎯 UX |
-| **Privacy Rating** | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | +67% |
-| **Security Rating** | ⭐⭐ | ⭐⭐⭐⭐⭐ | +150% |
-| **Production Ready** | ❌ | ✅ | ✅ |
-
-**Verdict**: fog v0.9 is an **essential upgrade** from pluto2.
-
----
-
-## ⚙️ Configuration
-
-### Command-Line Options
+### Send via Tor (remote)
 
 ```bash
-./fog [options]
+torify telnet YOUR_ONION.onion 2525
+```
+
+### Post to Usenet
+
+```bash
+telnet 127.0.0.1 2525
+
+EHLO client
+MAIL FROM:<anonymous@fog.local>
+RCPT TO:<mail2news@dizum.com>
+DATA
+From: Anonymous <anon@fog.local>
+Newsgroups: misc.test
+Subject: Test post via fog
+Date: Mon, 01 Dec 2025 12:00:00 +0000
+Message-ID: <unique-id@fog.local>
+
+Test message posted via fog mixnet.
+.
+QUIT
+```
+
+## Command Line Options
+
+```
+Usage: fog [options]
 
 Options:
-  --addr string
-        Listen address (default "127.0.0.1:2525")
-        Examples: 0.0.0.0:25, 127.0.0.1:2525
-        
-  --name string
-        Server v3 .onion hostname (required)
-        Must be a 56-character v3 .onion address
-        
-  --stats
-        Enable periodic statistics display (every 1 minute)
-        
-  --version
-        Show version information and exit
-        
-  -h, --help
-        Show this help message and exit
+  -name string        Hostname (.onion address)
+  -short-name string  Short name for logs (e.g., node1)
+  -smtp string        SMTP listen address (default "127.0.0.1:2525")
+  -node string        Node listen address (default "127.0.0.1:9999")
+  -sphinx             Enable Sphinx mixnet routing
+  -pki-file string    Path to nodes.json
+  -data-dir string    Data directory (default "./fog-data")
+  -debug              Enable debug logging
+  -export-node-info   Export node info for nodes.json
+  -version            Show version
 ```
 
-### Example Configurations
+## Ports
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 2525 | SMTP | Client email submission |
+| 9999 | Sphinx | Inter-node packet routing |
+
+## Security Considerations
+
+### Threat Model
+
+fog protects against:
+
+| Threat | Protection |
+|--------|------------|
+| Traffic Analysis | Fixed-size packets, cover traffic, batching |
+| Timing Attacks | Randomized delays, constant-time operations |
+| Replay Attacks | Message-ID cache with 24h expiration |
+| Node Compromise | Forward secrecy via ephemeral keys |
+| Size Correlation | Adaptive padding to fixed buckets |
+| Partial Network Observation | 3-hop mixnet provides unlinkability |
+| Global Adversary | Multi-hop routing breaks end-to-end correlation |
+| Metadata Analysis | No persistent metadata retention |
+
+### Limitations
+
+- Minimum 3 nodes required for Sphinx routing
+- Exit node sees unencrypted message (use PGP for E2E)
+- All nodes must share the same `nodes.json`
+- Tor is a hard dependency
+
+## Troubleshooting
+
+### "0 nodes healthy"
+
+1. Check if `nodes.json` has all nodes
+2. Verify file permissions: `chown fog:fog /var/lib/fog/nodes.json`
+3. Check Tor connectivity: `torify curl http://node.onion:9999`
+
+### "PKI Load failed: permission denied"
 
 ```bash
-# Development (localhost only)
-./fog --addr 127.0.0.1:2525 --name test.onion
-
-# Production (all interfaces, with stats)
-./fog --addr 0.0.0.0:25 --name your-real-v3-address.onion --stats
-
-# Custom port
-./fog --addr 0.0.0.0:587 --name your.onion
+chown fog:fog /var/lib/fog/nodes.json
+chmod 600 /var/lib/fog/nodes.json
 ```
 
-### Advanced Configuration (in code)
+### SMTP connection refused
 
-Edit `fog.go` constants for fine-tuning:
+1. Check if fog is running: `systemctl status fog`
+2. Verify port binding: `ss -tlnp | grep 2525`
+3. Check Tor hidden service: `cat /var/lib/tor/fog/hostname`
 
-```go
-const (
-    RelayWorkerCount     = 5              // Parallel workers
-    MixnetBatchWindow    = 30 * time.Second  // Batch window
-    CoverTrafficInterval = 15 * time.Second  // Cover traffic
-    DummyRecipientsMin   = 1              // Min dummy per batch
-    DummyRecipientsMax   = 3              // Max dummy per batch
-    ConnectionPoolSize   = 5              // Tor connection pool
-    MaxMessageSize       = 10 * 1024 * 1024  // 10MB limit
-)
-```
+## Cryptographic Libraries
 
-Rebuild after changes:
-```bash
-go build -o fog fog.go
-```
+- `golang.org/x/crypto/curve25519` - ECDH key agreement
+- `golang.org/x/crypto/hkdf` - HKDF-SHA256 key derivation
+- `golang.org/x/net/proxy` - Tor SOCKS5 proxy
+- `crypto/aes` + `crypto/cipher` - AES-256-GCM encryption
+- `crypto/hmac` + `crypto/sha256` - HMAC authentication
+- `crypto/rand` - Cryptographically secure randomness
 
----
+## References
 
-## 📈 Statistics
-
-Enable with `--stats` flag:
-
-```bash
-./fog --addr 0.0.0.0:25 --name your.onion --stats
-```
-
-Example output (every minute):
-```
-[STATS] Messages: Received=150, Delivered=148, Failed=2, Cover=45, Dummy=60
-```
-
-**Metrics**:
-- **Received**: Messages received from SMTP clients
-- **Delivered**: Messages successfully delivered
-- **Failed**: Messages failed after max retries
-- **Cover**: Cover traffic messages generated
-- **Dummy**: Dummy recipients injected
-
-**Success rate**: Delivered / Received × 100%  
-**Cover ratio**: Cover / Received × 100%  
-**Dummy ratio**: Dummy / Received × 100%
-
----
-
-## 🔧 Troubleshooting
-
-### Issue: "FATAL: Failed to create Tor dialer"
-
-**Solution**: Tor is not running
-```bash
-sudo systemctl status tor
-sudo systemctl start tor
-```
-
-### Issue: "Rate limit exceeded"
-
-**Solution**: This is normal DoS protection. Wait 1 minute or adjust rate limits in code.
-
-### Issue: "No MX records for domain"
-
-**Solution**: The destination domain has no MX records or DNS lookup failed. Check:
-- Domain is correct
-- DNS is reachable
-- MX records exist: `dig MX domain.com`
-
-### Issue: Port binding error
-
-**Solution**: Port already in use
-```bash
-# Check what's using the port
-sudo netstat -tulpn | grep :25
-
-# Use different port
-./fog --addr 0.0.0.0:2525 --name your.onion
-```
-
-### Issue: Graceful shutdown not working
-
-**Solution**: Force kill if needed
-```bash
-# Ctrl+C first (wait up to 30s)
-# If doesn't respond:
-ps aux | grep fog
-kill -9 [PID]
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────┐
-│ SMTP Client │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│          fog SMTP Server            │
-│  ┌──────────────────────────────┐   │
-│  │  Rate Limiter (10 req/min)   │   │
-│  └──────────────────────────────┘   │
-│  ┌──────────────────────────────┐   │
-│  │  Message ID Cache (24h)      │   │
-│  └──────────────────────────────┘   │
-│  ┌──────────────────────────────┐   │
-│  │  Size Normalization          │   │
-│  │  (32KB, 64KB, ... 10MB)      │   │
-│  └──────────────────────────────┘   │
-│  ┌──────────────────────────────┐   │
-│  │  Header Sanitization         │   │
-│  │  (Remove X-Mailer, etc)      │   │
-│  └──────────────────────────────┘   │
-│  ┌──────────────────────────────┐   │
-│  │  Mixnet Batcher (30s window) │   │
-│  │  + Dummy Recipients (1-3)    │   │
-│  └──────────────────────────────┘   │
-│  ┌──────────────────────────────┐   │
-│  │  Cover Traffic Generator     │   │
-│  │  (Poisson distribution)      │   │
-│  └──────────────────────────────┘   │
-└────────────┬────────────────────────┘
-             │
-             ▼
-     ┌───────────────┐
-     │  Mail Queue   │
-     │  (buffered)   │
-     └───────┬───────┘
-             │
-      ┌──────┴──────┐
-      │   Workers   │
-      │   (5 × )    │
-      └──────┬──────┘
-             │
-             ▼
-   ┌─────────────────────┐
-   │ Connection Pool (5) │
-   │  Tor SOCKS5 Proxy   │
-   └──────────┬──────────┘
-              │
-              ▼
-        ┌──────────┐
-        │   Tor    │
-        │ Network  │
-        └─────┬────┘
-              │
-       ┌──────┴──────┐
-       │             │
-       ▼             ▼
-  .onion dest   Clearnet dest
-```
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Here's how:
-
-1. **Fork** the repository
-2. **Create** a feature branch: `git checkout -b feature/amazing-feature`
-3. **Commit** your changes: `git commit -m 'Add amazing feature'`
-4. **Push** to the branch: `git push origin feature/amazing-feature`
-5. **Open** a Pull Request
-
-### Guidelines
-
-- Follow Go best practices
-- Add tests for new features
-- Update documentation
-- Keep commits atomic and well-described
-- Respect privacy and security principles
-
-### Development Setup
-
-```bash
-# Clone your fork
-git clone https://github.com/gabrix73/fog.git
-cd fog
-
-# Install development dependencies
-go mod tidy
-
-# Run tests (if any)
-go test ./...
-
-# Build
-go build -o fog fog.go
-
-# Test
-./fog --help
----
-
-## 🙏 Acknowledgments
-
-- Thanks to all contributors and users who supported the `pluto2` project
-- Thanks to the Tor Project for making anonymous communication possible
-- Thanks to the Go community for excellent libraries
-
-fog v0.9 continues the mission with major improvements in privacy and security.
-
----
-
-## 📞 Contact & Support
-
-- **Issues**: https://github.com/gabrix73/fog/issues
-- **Discussions**: https://github.com/gabrix73/fog/discussions
-- **Pull Requests**: https://github.com/gabrix73/fog/pulls
-
-### Security Issues
-
-For security vulnerabilities, please **DO NOT** open a public issue.  
-Instead, contact: [security@tcpreset.net]
-
----
-
-## 🗺️ Roadmap
-
-### v0.9 (Current) ✅
-- Complete rewrite from pluto2
-- 8 advanced anti-tracking techniques
-- All critical bugs fixed
-- Production-ready
-
-### v1.0 (Future)
-- [ ] STARTTLS support
-- [ ] Optional authentication
-- [ ] Prometheus metrics endpoint
-- [ ] Admin API
-- [ ] Config file support
-- [ ] Multiple server names
-
-### v1.1+ (Ideas)
-- [ ] Web UI for statistics
-- [ ] Docker container
-- [ ] Kubernetes support
-- [ ] Message queueing to disk
-- [ ] Clustering support
-
----
-
-## ⚡ Performance
-
-Typical performance metrics:
-
-- **Throughput**: ~20 messages/second (with connection pooling)
-- **Latency**: ~1-5 seconds per message (includes Tor + mixnet delay)
-- **Memory**: ~80MB base usage
-- **CPU**: ~10-15% on average (single core)
-- **Bandwidth**: +300-400% overhead (privacy trade-off)
-
-**Privacy vs Performance**:
-- More dummy recipients = more privacy, less throughput
-- Larger batch windows = more privacy, higher latency
-- More cover traffic = more privacy, more bandwidth
-
----
-
-## 🌍 Use Cases
-
-fog is designed for scenarios requiring maximum email privacy:
-
-✅ **Whistleblowing** - Protect source identity  
-✅ **Journalism** - Secure communication with sources  
-✅ **Activism** - Evade surveillance  
-✅ **Privacy-conscious users** - General secure email  
-✅ **Research** - Privacy technology experiments  
-
-❌ **NOT for**: Spam, illegal activities, bulk commercial email
-
----
-
-## 📚 Further Reading
-
+- [Sphinx: A Compact and Provably Secure Mix Format](https://cypherpunks.ca/~iang/pubs/Sphinx_Oakland09.pdf) - Danezis & Goldberg, IEEE S&P 2009
 - [Tor Project](https://www.torproject.org/)
 - [RFC 5321 - SMTP](https://tools.ietf.org/html/rfc5321)
-- [Mixnet Research](https://www.freehaven.net/anonbib/)
-- [Traffic Analysis Attacks](https://en.wikipedia.org/wiki/Traffic_analysis)
+- [RFC 5536 - Netnews Article Format](https://tools.ietf.org/html/rfc5536)
+
+## License
+
+MIT License
+
+## Contributing
+
+1. Fork the repository
+2. Create feature branch
+3. Submit pull request
+
+## Disclaimer
+
+This software is provided for educational and research purposes. Users are responsible for complying with applicable laws in their jurisdiction. The authors are not responsible for misuse.
 
 ---
 
-## 🎯 Quick Links
-
-- 📥 [Download Latest Release](https://github.com/gabrix73/fog/releases/latest)
-- 📖 [Documentation](https://github.com/gabrix73/fog/tree/main)
-- 🐛 [Report Bug](https://github.com/gabrix73/fog/issues/new)
-- 💡 [Request Feature](https://github.com/gabrix73/fog/issues/new)
-- 💬 [Discussions](https://github.com/gabrix73/fog/discussions)
-
----
-
-**🌫️ fog v0.9 - Anonymous SMTP Relay Server 🌫️**
-
-*Stay Foggy. Stay Anonymous. Stay Safe.*
-
-⭐ **Star this repo if you find it useful!** ⭐
-
-[Report Bug](https://github.com/gabrix73/fog/issues) · 
-[Request Feature](https://github.com/gabrix73/fog/issues) · 
-[Documentation](https://github.com/gabrix73/fog/tree/main)
-
-Made with ❤️ for privacy
-
-
+**fog** - *When privacy is not optional*
 
 
