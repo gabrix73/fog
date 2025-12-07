@@ -362,15 +362,15 @@ sudo journalctl -u fog -f | grep SANITIZE
 
 ### Current fog Network
 
-The fog network currently consists of 5 nodes across Europe:
+The fog network currently consists of 5 active nodes:
 
-| Node | Location | Operator | Status |
-|------|----------|----------|--------|
-| kvara | 🇮🇹 Italy | - | ✅ Active |
-| dries | 🇫🇷 France | - | ✅ Active |
-| mct8 | 🇩🇪 Germany | - | ✅ Active |
-| news | 🇺🇸 USA | - | ✅ Active |
-| pietro | 🇮🇹 Italy | - | ✅ Active |
+| Node | Status |
+|------|--------|
+| kvara | ✅ Active |
+| dries | ✅ Active |
+| mct8 | ✅ Active |
+| news | ✅ Active |
+| pietro | ✅ Active |
 
 **Join us!** Run your own node and strengthen the network's resilience.
 
@@ -378,7 +378,7 @@ The fog network currently consists of 5 nodes across Europe:
 
 - **3 nodes minimum** for Sphinx routing (3-hop paths)
 - **5+ nodes recommended** for proper anonymity set
-- **Geographic diversity** improves security
+- **Network diversity** improves security
 
 ---
 
@@ -538,10 +538,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## 📞 Contact
 
-- **Website**: https://fog.network
-- **Email**: info@fog.network
-- **IRC**: #fog on Libera.Chat
-- **Usenet**: alt.privacy.fog
+- **Website**: https://yamn.virebent.art
+- **Usenet**: alt.privacy.anon-server
 
 ---
 
