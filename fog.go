@@ -1,5 +1,5 @@
-// fog v2.0.1 - Anonymous SMTP Relay with Sphinx Mixnet
-// Fixed padding, no PKI server needed, debug logs
+// fog v2.1.1 - Anonymous SMTP Relay with Sphinx Mixnet + Header Sanitization
+// Features: delay pool, exit node header sanitization (RFC compliant)
 // Copyright 2025 - fog Project
 
 package main
@@ -7,23 +7,25 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/smtp"
+	"net/textproto"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,13 +35,14 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/proxy"
 )
 
 const (
-	Version = "2.0.1"
+	Version = "2.1.1"
 
 	TorSocks    = "127.0.0.1:9050"
 	DefaultPort = "2525"
@@ -53,6 +56,7 @@ const (
 
 	HealthInterval = 3 * time.Minute
 	StatsInterval  = 60 * time.Second
+	PoolInterval   = 1 * time.Minute
 
 	MaxMsgSize   = 10 << 20
 	MaxRecipient = 50
@@ -68,9 +72,47 @@ const (
 	NonceSize  = 12
 	HMACSize   = 32
 
-	// Padding bucket for Sphinx packets (not message content)
-	PaddedPayloadSize = 64 * 1024 // 64KB fixed size for all Sphinx payloads
+	PaddedPayloadSize = 64 * 1024
+
+	DefaultMinPoolDelay = 1 * time.Hour
+	DefaultMaxPoolDelay = 24 * time.Hour
 )
+
+// ============================================================================
+// DELAY STRATEGIES
+// ============================================================================
+
+type DelayStrategy int
+
+const (
+	DelayExponential DelayStrategy = iota
+	DelayConstant
+	DelayPoisson
+)
+
+func (d DelayStrategy) String() string {
+	switch d {
+	case DelayExponential:
+		return "exponential"
+	case DelayConstant:
+		return "constant"
+	case DelayPoisson:
+		return "poisson"
+	default:
+		return "unknown"
+	}
+}
+
+func parseDelayStrategy(s string) DelayStrategy {
+	switch strings.ToLower(s) {
+	case "constant":
+		return DelayConstant
+	case "poisson":
+		return DelayPoisson
+	default:
+		return DelayExponential
+	}
+}
 
 // ============================================================================
 // TYPES
@@ -82,6 +124,16 @@ type Message struct {
 	To   []string
 	Data []byte
 	Time time.Time
+}
+
+type QueuedMessage struct {
+	ID          string
+	From        string
+	To          string
+	Data        []byte
+	EnqueueTime time.Time
+	SendAfter   time.Time
+	Attempts    int
 }
 
 type Node struct {
@@ -106,22 +158,25 @@ type PKI struct {
 }
 
 type LocalNode struct {
-	ID      string
-	Private []byte
-	Public  []byte
-	Address string
-	mu      sync.RWMutex
+	ID        string
+	Private   []byte
+	Public    []byte
+	Address   string
+	ShortName string
+	mu        sync.RWMutex
 }
 
 type Stats struct {
-	Start   time.Time
-	Recv    int64
-	Sent    int64
-	Failed  int64
-	Sphinx  int64
-	Direct  int64
-	MixRecv int64
-	MixFwd  int64
+	Start    time.Time
+	Recv     int64
+	Sent     int64
+	Failed   int64
+	Sphinx   int64
+	Direct   int64
+	MixRecv  int64
+	MixFwd   int64
+	Queued   int64
+	Delayed  int64
 }
 
 type ReplayCache struct {
@@ -148,9 +203,16 @@ type SphinxPacket struct {
 }
 
 type RoutingInfo struct {
-	Next string `json:"next"`
-	From string `json:"from,omitempty"`
-	To   string `json:"to,omitempty"`
+	NextHop string
+	IsExit  bool
+}
+
+type DelayPool struct {
+	db          *sql.DB
+	minDelay    time.Duration
+	maxDelay    time.Duration
+	strategy    DelayStrategy
+	mu          sync.RWMutex
 }
 
 // ============================================================================
@@ -158,742 +220,721 @@ type RoutingInfo struct {
 // ============================================================================
 
 var (
-	local     *LocalNode
-	pki       *PKI
-	stats     *Stats
-	replay    *ReplayCache
-	batch     *Batch
-	queue     chan *Message
-	torDialer proxy.Dialer
-	hostname  string
-	pkiFile   string
-	dataDir   string
-	useSphinx atomic.Bool
-	debugMode bool
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	pki         = &PKI{Nodes: make([]*Node, 0)}
+	localNode   = &LocalNode{}
+	stats       = &Stats{Start: time.Now()}
+	replayCache = &ReplayCache{cache: make(map[string]time.Time)}
+	batch       = &Batch{packets: make([]*SphinxPacket, 0)}
+	delayPool   *DelayPool
+
+	enableSphinx bool
+	enableDelay  bool
+	debug        bool
 )
 
 // ============================================================================
-// DEBUG LOGGING
+// DELAY POOL - SQLITE DATABASE
 // ============================================================================
 
-func dbg(format string, args ...interface{}) {
-	if debugMode {
-		log.Printf("[DEBUG] "+format, args...)
+func NewDelayPool(dbPath string, minDelay, maxDelay time.Duration, strategy DelayStrategy) (*DelayPool, error) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+
+	schema := `
+		CREATE TABLE IF NOT EXISTS message_queue (
+			id TEXT PRIMARY KEY,
+			from_addr TEXT NOT NULL,
+			to_addr TEXT NOT NULL,
+			data BLOB NOT NULL,
+			enqueue_time INTEGER NOT NULL,
+			send_after INTEGER NOT NULL,
+			attempts INTEGER DEFAULT 0,
+			created_at INTEGER DEFAULT (strftime('%s', 'now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_send_after ON message_queue(send_after);
+	`
+	
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create schema: %w", err)
+	}
+
+	pool := &DelayPool{
+		db:       db,
+		minDelay: minDelay,
+		maxDelay: maxDelay,
+		strategy: strategy,
+	}
+
+	return pool, nil
+}
+
+func (p *DelayPool) Close() error {
+	return p.db.Close()
+}
+
+func (p *DelayPool) calculateDelay() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	switch p.strategy {
+	case DelayConstant:
+		return p.minDelay + time.Duration(secureRandInt64(int64(p.maxDelay-p.minDelay)))
+	
+	case DelayPoisson:
+		lambda := float64(p.minDelay+p.maxDelay) / 2.0
+		delay := time.Duration(poissonRandom(lambda))
+		if delay < p.minDelay {
+			delay = p.minDelay
+		}
+		if delay > p.maxDelay {
+			delay = p.maxDelay
+		}
+		return delay
+	
+	case DelayExponential:
+		fallthrough
+	default:
+		mean := float64(p.minDelay+p.maxDelay) / 2.0
+		lambda := 1.0 / mean
+		
+		u := secureRandFloat64()
+		delay := time.Duration(-math.Log(1.0-u) / lambda)
+		
+		if delay < p.minDelay {
+			delay = p.minDelay
+		}
+		if delay > p.maxDelay {
+			delay = p.maxDelay
+		}
+		return delay
 	}
 }
 
-// ============================================================================
-// CRYPTO
-// ============================================================================
-
-func secureDelay() time.Duration {
-	b := make([]byte, 8)
-	rand.Read(b)
-	val := binary.BigEndian.Uint64(b)
-	// Map to range [MinDelay, MaxDelay]
-	rangeMs := uint64((MaxDelay - MinDelay).Milliseconds())
-	delayMs := MinDelay.Milliseconds() + int64(val%rangeMs)
-	return time.Duration(delayMs) * time.Millisecond
-}
-
-func secureShuffle[T any](s []T) {
-	for i := len(s) - 1; i > 0; i-- {
-		jBig, _ := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
-		j := int(jBig.Int64())
-		s[i], s[j] = s[j], s[i]
+func (p *DelayPool) Enqueue(msg *Message) error {
+	delay := p.calculateDelay()
+	sendAfter := time.Now().Add(delay)
+	
+	for _, to := range msg.To {
+		_, err := p.db.Exec(`
+			INSERT INTO message_queue (id, from_addr, to_addr, data, enqueue_time, send_after)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			msg.ID+"-"+to,
+			msg.From,
+			to,
+			msg.Data,
+			msg.Time.Unix(),
+			sendAfter.Unix(),
+		)
+		if err != nil {
+			return fmt.Errorf("enqueue: %w", err)
+		}
 	}
+
+	atomic.AddInt64(&stats.Queued, int64(len(msg.To)))
+	
+	if debug {
+		log.Printf("[POOL] Enqueued %s: %d recipients, delay=%v, send_after=%s",
+			msg.ID, len(msg.To), delay, sendAfter.Format("15:04:05"))
+	}
+	
+	return nil
 }
 
-func deriveKeys(secret []byte) (enc, mac []byte, err error) {
-	kdf := hkdf.New(sha256.New, secret, nil, []byte("fog-v2"))
-	enc = make([]byte, AESKeySize)
-	mac = make([]byte, AESKeySize)
-	if _, err = io.ReadFull(kdf, enc); err != nil {
+func (p *DelayPool) GetReady() ([]*QueuedMessage, error) {
+	now := time.Now().Unix()
+	
+	rows, err := p.db.Query(`
+		SELECT id, from_addr, to_addr, data, enqueue_time, send_after, attempts
+		FROM message_queue
+		WHERE send_after <= ?
+		ORDER BY send_after
+		LIMIT 100`,
+		now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []*QueuedMessage
+	for rows.Next() {
+		var m QueuedMessage
+		var enqT, sendT int64
+		
+		err := rows.Scan(&m.ID, &m.From, &m.To, &m.Data, &enqT, &sendT, &m.Attempts)
+		if err != nil {
+			log.Printf("[POOL] Scan error: %v", err)
+			continue
+		}
+		
+		m.EnqueueTime = time.Unix(enqT, 0)
+		m.SendAfter = time.Unix(sendT, 0)
+		messages = append(messages, &m)
+	}
+
+	return messages, nil
+}
+
+func (p *DelayPool) Delete(id string) error {
+	_, err := p.db.Exec("DELETE FROM message_queue WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	atomic.AddInt64(&stats.Queued, -1)
+	atomic.AddInt64(&stats.Delayed, 1)
+	return nil
+}
+
+func (p *DelayPool) IncrementAttempts(id string) error {
+	_, err := p.db.Exec("UPDATE message_queue SET attempts = attempts + 1 WHERE id = ?", id)
+	return err
+}
+
+func (p *DelayPool) Count() (int64, error) {
+	var count int64
+	err := p.db.QueryRow("SELECT COUNT(*) FROM message_queue").Scan(&count)
+	return count, err
+}
+
+func (p *DelayPool) Stats() (total, ready int64, oldest time.Time, err error) {
+	err = p.db.QueryRow("SELECT COUNT(*), MIN(send_after) FROM message_queue").Scan(&total, &oldest)
+	if err != nil {
 		return
 	}
-	_, err = io.ReadFull(kdf, mac)
+	
+	now := time.Now().Unix()
+	err = p.db.QueryRow("SELECT COUNT(*) FROM message_queue WHERE send_after <= ?", now).Scan(&ready)
 	return
 }
 
-func encrypt(plain, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
+// ============================================================================
+// SECURE RANDOM UTILITIES
+// ============================================================================
+
+func secureRandInt64(max int64) int64 {
+	if max <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(max))
 	if err != nil {
-		return nil, err
+		return 0
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	return gcm.Seal(nonce, nonce, plain, nil), nil
+	return n.Int64()
 }
 
-func decrypt(ciphertext, key []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	if len(ciphertext) < gcm.NonceSize() {
-		return nil, errors.New("too short")
-	}
-	nonce := ciphertext[:gcm.NonceSize()]
-	return gcm.Open(nil, nonce, ciphertext[gcm.NonceSize():], nil)
+func secureRandFloat64() float64 {
+	n := secureRandInt64(1 << 53)
+	return float64(n) / float64(1<<53)
 }
 
-func computeMAC(data, key []byte) []byte {
-	h := hmac.New(sha256.New, key)
-	h.Write(data)
-	return h.Sum(nil)
+func poissonRandom(lambda float64) float64 {
+	L := math.Exp(-lambda)
+	k := 0.0
+	p := 1.0
+	
+	for p > L {
+		k++
+		p *= secureRandFloat64()
+	}
+	
+	return k - 1.0
 }
 
-func verifyMAC(data, mac, key []byte) bool {
-	return hmac.Equal(computeMAC(data, key), mac)
+func secureRandDelay(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	delta := int64(max - min)
+	return min + time.Duration(secureRandInt64(delta))
+}
+
+func secureRandBytes(n int) ([]byte, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func secureRandHex(n int) string {
+	b, _ := secureRandBytes(n)
+	return hex.EncodeToString(b)
 }
 
 // ============================================================================
-// PADDING - FIXED: Preserves original message
-// Format: [4 bytes original length][original data][random padding]
+// HEADER SANITIZATION (v2.1.1)
 // ============================================================================
 
-func padPayload(data []byte) []byte {
-	origLen := len(data)
-	
-	// Create padded payload with length prefix
-	// Format: [4 bytes len][data][random padding to PaddedPayloadSize]
-	padded := make([]byte, PaddedPayloadSize)
-	
-	// First 4 bytes: original length
-	binary.BigEndian.PutUint32(padded[:4], uint32(origLen))
-	
-	// Copy original data
-	copy(padded[4:], data)
-	
-	// Fill rest with random bytes
-	rand.Read(padded[4+origLen:])
-	
-	dbg("Padded payload: %d -> %d bytes", origLen, PaddedPayloadSize)
-	return padded
-}
-
-func unpadPayload(padded []byte) ([]byte, error) {
-	if len(padded) < 4 {
-		return nil, errors.New("padded data too short")
-	}
-	
-	origLen := binary.BigEndian.Uint32(padded[:4])
-	
-	if int(origLen) > len(padded)-4 {
-		return nil, fmt.Errorf("invalid length: %d > %d", origLen, len(padded)-4)
-	}
-	
-	data := make([]byte, origLen)
-	copy(data, padded[4:4+origLen])
-	
-	dbg("Unpadded payload: %d -> %d bytes", len(padded), origLen)
-	return data, nil
-}
-
-// ============================================================================
-// REPLAY CACHE
-// ============================================================================
-
-func newReplayCache() *ReplayCache {
-	return &ReplayCache{cache: make(map[string]time.Time)}
-}
-
-func (r *ReplayCache) Check(id string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, exists := r.cache[id]; exists {
-		dbg("Replay detected: %s", id)
-		return false
+func sanitizeHeaders(payload []byte) []byte {
+	// Parse message
+	msg, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(payload))).ReadMIMEHeader()
+	if err != nil {
+		return payload // Can't parse, return as-is
 	}
 
-	r.cache[id] = time.Now()
+	// Find headers/body boundary
+	headerEnd := bytes.Index(payload, []byte("\r\n\r\n"))
+	if headerEnd == -1 {
+		headerEnd = bytes.Index(payload, []byte("\n\n"))
+		if headerEnd == -1 {
+			return payload
+		}
+		headerEnd += 2
+	} else {
+		headerEnd += 4
+	}
+	
+	body := payload[headerEnd:]
 
-	if len(r.cache) > CacheSize {
-		now := time.Now()
-		for k, v := range r.cache {
-			if now.Sub(v) > CacheTTL {
-				delete(r.cache, k)
-			}
+	// Build sanitized headers
+	sanitized := make(textproto.MIMEHeader)
+
+	// REPLACE: From
+	sanitized.Set("From", fmt.Sprintf("Anonymous <anonymous@%s.fog>", localNode.ShortName))
+
+	// REPLACE: Message-ID
+	sanitized.Set("Message-ID", fmt.Sprintf("<%s@%s.fog>", secureRandHex(32), localNode.ShortName))
+
+	// REPLACE: Date (randomize ±1-2h)
+	if origDate := msg.Get("Date"); origDate != "" {
+		if t, err := time.Parse(time.RFC1123Z, origDate); err == nil {
+			offset := secureRandInt64(7200) - 3600 // ±1h in seconds
+			newDate := t.Add(time.Duration(offset) * time.Second)
+			sanitized.Set("Date", newDate.Format(time.RFC1123Z))
+		} else {
+			sanitized.Set("Date", time.Now().Format(time.RFC1123Z))
+		}
+	} else {
+		sanitized.Set("Date", time.Now().Format(time.RFC1123Z))
+	}
+
+	// KEEP: Essential headers
+	keepHeaders := []string{
+		"To", "Newsgroups", "Subject",
+		"Content-Type", "Content-Transfer-Encoding", "MIME-Version",
+		"References", "In-Reply-To", // Threading (RFC 5536)
+	}
+
+	for _, h := range keepHeaders {
+		if v := msg.Get(h); v != "" {
+			sanitized.Set(h, v)
 		}
 	}
-	return true
-}
 
-// ============================================================================
-// LOCAL NODE
-// ============================================================================
+	// Rebuild message
+	var buf bytes.Buffer
+	for key, values := range sanitized {
+		for _, value := range values {
+			buf.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
+		}
+	}
+	buf.WriteString("\r\n")
+	buf.Write(body)
 
-func initNode(addr string) {
-	keyFile := filepath.Join(dataDir, "node.key")
-
-	var priv []byte
-	if data, err := os.ReadFile(keyFile); err == nil && len(data) == 32 {
-		priv = data
-		log.Printf("[NODE] Loaded existing key")
-	} else {
-		priv = make([]byte, 32)
-		rand.Read(priv)
-		os.WriteFile(keyFile, priv, 0600)
-		log.Printf("[NODE] Generated new key")
+	if debug {
+		log.Printf("[SANITIZE] Headers cleaned: From=anonymous@%s.fog", localNode.ShortName)
 	}
 
-	pub, _ := curve25519.X25519(priv, curve25519.Basepoint)
-	id := fmt.Sprintf("%x", sha256.Sum256(pub))
-
-	local = &LocalNode{
-		ID:      id,
-		Private: priv,
-		Public:  pub,
-		Address: addr,
-	}
-
-	log.Printf("[NODE] ID: %s", id[:16])
-	log.Printf("[NODE] Address: %s", addr)
-	dbg("Full ID: %s", id)
-	dbg("PubKey: %x", pub)
+	return buf.Bytes()
 }
 
 // ============================================================================
-// PKI - File based, no server needed
+// PKI MANAGEMENT
 // ============================================================================
-
-func newPKI() *PKI {
-	return &PKI{Nodes: make([]*Node, 0)}
-}
 
 func (p *PKI) Load(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("read pki: %w", err)
+	}
+
+	if err := json.Unmarshal(data, p); err != nil {
+		return fmt.Errorf("parse pki: %w", err)
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if err := json.Unmarshal(data, p); err != nil {
-		return err
+	for _, node := range p.Nodes {
+		node.Healthy = false
 	}
-
-	// Mark all as healthy initially
-	for _, n := range p.Nodes {
-		n.Healthy = true
-		n.LastOK = time.Now()
-		dbg("Loaded node: %s (%s) at %s", n.Name, n.ID[:16], n.Address)
-	}
+	p.mu.Unlock()
 
 	log.Printf("[PKI] Loaded %d nodes from %s", len(p.Nodes), path)
 	return nil
-}
-
-func (p *PKI) GetAllOther() []*Node {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	var nodes []*Node
-	for _, n := range p.Nodes {
-		if local != nil && n.ID == local.ID {
-			continue
-		}
-		nodes = append(nodes, n)
-	}
-	return nodes
 }
 
 func (p *PKI) GetHealthy() []*Node {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	var nodes []*Node
+	var healthy []*Node
 	for _, n := range p.Nodes {
-		if !n.Healthy {
-			continue
+		if n.Healthy && n.ID != localNode.ID {
+			healthy = append(healthy, n)
 		}
-		if local != nil && n.ID == local.ID {
-			continue
-		}
-		nodes = append(nodes, n)
 	}
-	return nodes
+	return healthy
 }
 
-func (p *PKI) HealthyCount() int {
-	return len(p.GetHealthy())
+func (p *PKI) GetNode(id string) *Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for _, n := range p.Nodes {
+		if n.ID == id {
+			return n
+		}
+	}
+	return nil
+}
+
+func (p *PKI) RandomPath(hops int) ([]*Node, error) {
+	healthy := p.GetHealthy()
+	
+	if len(healthy) < hops {
+		return nil, fmt.Errorf("insufficient nodes: need %d, have %d", hops, len(healthy))
+	}
+
+	shuffled := make([]*Node, len(healthy))
+	copy(shuffled, healthy)
+	
+	for i := len(shuffled) - 1; i > 0; i-- {
+		j := int(secureRandInt64(int64(i + 1)))
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	}
+
+	return shuffled[:hops], nil
 }
 
 // ============================================================================
-// BATCH
+// LOCAL NODE
 // ============================================================================
 
-func newBatch() *Batch {
-	return &Batch{
-		packets: make([]*SphinxPacket, 0, BatchSize),
-		start:   time.Now(),
+func (n *LocalNode) Init(name, shortName string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	private := make([]byte, 32)
+	if _, err := rand.Read(private); err != nil {
+		return err
 	}
+
+	public, err := curve25519.X25519(private, curve25519.Basepoint)
+	if err != nil {
+		return err
+	}
+
+	hash := sha256.Sum256(public)
+	n.ID = base64.RawURLEncoding.EncodeToString(hash[:])
+
+	n.Private = private
+	n.Public = public
+	n.Address = name
+	n.ShortName = shortName
+
+	log.Printf("[NODE] ID=%s Address=%s Name=%s", n.ID[:16], name, shortName)
+	return nil
 }
 
-func (b *Batch) Add(p *SphinxPacket) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.packets = append(b.packets, p)
-	dbg("Batch: added packet, now %d", len(b.packets))
+func (n *LocalNode) ExportInfo(name, shortName string) error {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	info := map[string]interface{}{
+		"version": Version,
+		"updated": time.Now().UTC().Format(time.RFC3339),
+		"nodes": []map[string]string{
+			{
+				"node_id":    n.ID,
+				"public_key": base64.StdEncoding.EncodeToString(n.Public),
+				"address":    name + ":" + NodePort,
+				"name":       shortName,
+				"version":    Version,
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile("nodes.json", data, 0644)
 }
 
-func (b *Batch) Ready() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.packets) >= BatchSize || (len(b.packets) > 0 && time.Since(b.start) > BatchWindow)
+// ============================================================================
+// REPLAY CACHE
+// ============================================================================
+
+func (r *ReplayCache) Check(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, exists := r.cache[id]
+	return exists
 }
 
-func (b *Batch) Flush() []*SphinxPacket {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	pkts := b.packets
-	b.packets = make([]*SphinxPacket, 0, BatchSize)
-	b.start = time.Now()
-
-	secureShuffle(pkts)
-	dbg("Batch: flushed %d packets (shuffled)", len(pkts))
-	return pkts
+func (r *ReplayCache) Add(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cache[id] = time.Now()
 }
 
-func batchWorker() {
-	defer wg.Done()
-	ticker := time.NewTicker(time.Second)
+func (r *ReplayCache) Cleanup() {
+	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if batch.Ready() {
-				pkts := batch.Flush()
-				log.Printf("[BATCH] Processing %d packets", len(pkts))
-				for _, p := range pkts {
-					go processPacket(p)
-				}
+	for range ticker.C {
+		r.mu.Lock()
+		now := time.Now()
+		for id, t := range r.cache {
+			if now.Sub(t) > CacheTTL {
+				delete(r.cache, id)
 			}
 		}
+		r.mu.Unlock()
 	}
 }
 
 // ============================================================================
-// SPHINX PACKET
+// SPHINX PACKET FORMAT
 // ============================================================================
 
-func createPacket(msg *Message, route []*Node) (*SphinxPacket, error) {
-	if len(route) != SphinxHops {
-		return nil, fmt.Errorf("need %d hops, got %d", SphinxHops, len(route))
+func buildSphinxPacket(path []*Node, payload []byte) (*SphinxPacket, error) {
+	if len(path) == 0 {
+		return nil, errors.New("empty path")
 	}
 
-	dbg("Creating Sphinx packet for %s", msg.ID)
-	dbg("Route: %s -> %s -> %s", route[0].Name, route[1].Name, route[2].Name)
-
-	// Build routing info
-	routings := make([]RoutingInfo, SphinxHops)
-	for i := 0; i < SphinxHops-1; i++ {
-		routings[i] = RoutingInfo{Next: route[i+1].Address}
-		dbg("Hop %d: forward to %s", i, route[i+1].Address)
+	paddedPayload := make([]byte, PaddedPayloadSize)
+	binary.BigEndian.PutUint32(paddedPayload[0:4], uint32(len(payload)))
+	copy(paddedPayload[4:], payload)
+	
+	if len(payload)+4 < PaddedPayloadSize {
+		rand.Read(paddedPayload[4+len(payload):])
 	}
 
-	// Last hop: EXIT with delivery info
-	var validTo []string
-	for _, to := range msg.To {
-		to = strings.TrimSpace(to)
-		if to != "" {
-			validTo = append(validTo, to)
+	routing := make([]byte, 0, len(path)*64)
+	for i, node := range path {
+		isExit := (i == len(path)-1)
+		
+		info := &RoutingInfo{
+			NextHop: node.Address,
+			IsExit:  isExit,
 		}
+		
+		infoBytes, _ := json.Marshal(info)
+		routing = append(routing, infoBytes...)
+		routing = append(routing, 0)
 	}
-	if len(validTo) == 0 {
-		return nil, errors.New("no recipients")
-	}
 
-	routings[SphinxHops-1] = RoutingInfo{
-		Next: "EXIT",
-		From: msg.From,
-		To:   strings.Join(validTo, ","),
-	}
-	dbg("Hop %d: EXIT, deliver to %s", SphinxHops-1, validTo)
+	ephPrivate := make([]byte, 32)
+	rand.Read(ephPrivate)
+	ephPublic, _ := curve25519.X25519(ephPrivate, curve25519.Basepoint)
 
-	// PAD the message payload BEFORE encryption
-	paddedMsg := padPayload(msg.Data)
-	dbg("Message padded: %d -> %d bytes", len(msg.Data), len(paddedMsg))
+	encrypted := paddedPayload
+	sharedSecrets := make([][]byte, 0)
 
-	// Encrypt layers (reverse: exit -> entry)
-	payload := paddedMsg
-	var ephKeys [][32]byte
-	var secrets [][]byte
-
-	for i := len(route) - 1; i >= 0; i-- {
-		node := route[i]
-		dbg("Encrypting layer %d for %s", i, node.Name)
-
-		// Ephemeral key
-		ephPriv := make([]byte, 32)
-		rand.Read(ephPriv)
-		ephPub, _ := curve25519.X25519(ephPriv, curve25519.Basepoint)
-
-		// Shared secret
-		nodePub, err := node.GetPubKey()
+	for i := len(path) - 1; i >= 0; i-- {
+		nodePubKey, err := path[i].GetPubKey()
 		if err != nil {
-			return nil, fmt.Errorf("decode pubkey for %s: %w", node.Name, err)
+			return nil, err
 		}
-		shared, _ := curve25519.X25519(ephPriv, nodePub)
 
-		encKey, _, _ := deriveKeys(shared)
-
-		// Routing JSON
-		routeData, _ := json.Marshal(routings[i])
-		dbg("Layer %d routing: %s", i, string(routeData))
-
-		// Combine: [4-byte routing length][routing][payload]
-		combined := make([]byte, 4+len(routeData)+len(payload))
-		binary.BigEndian.PutUint32(combined[:4], uint32(len(routeData)))
-		copy(combined[4:], routeData)
-		copy(combined[4+len(routeData):], payload)
-
-		// Encrypt
-		encrypted, err := encrypt(combined, encKey)
+		shared, err := curve25519.X25519(ephPrivate, nodePubKey)
 		if err != nil {
-			return nil, fmt.Errorf("encrypt layer %d: %w", i, err)
+			return nil, err
+		}
+		sharedSecrets = append([][]byte{shared}, sharedSecrets...)
+
+		kdf := hkdf.New(sha256.New, shared, nil, []byte("fog-sphinx-v2"))
+		key := make([]byte, AESKeySize)
+		kdf.Read(key)
+
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, err
 		}
 
-		dbg("Layer %d: %d -> %d bytes (encrypted)", i, len(combined), len(encrypted))
-		payload = encrypted
+		nonce := make([]byte, NonceSize)
+		rand.Read(nonce)
 
-		var ek [32]byte
-		copy(ek[:], ephPub)
-		ephKeys = append([][32]byte{ek}, ephKeys...)
-		secrets = append([][]byte{shared}, secrets...)
+		encrypted = gcm.Seal(nonce, nonce, encrypted, nil)
 	}
 
-	// Build header
 	header := &SphinxHeader{
 		Version: 2,
-		EphKey:  ephKeys[0],
+		Routing: routing,
 	}
+	copy(header.EphKey[:], ephPublic)
 
-	// Remaining ephemeral keys
-	for _, k := range ephKeys[1:] {
-		header.Routing = append(header.Routing, k[:]...)
-	}
+	mac := hmac.New(sha256.New, sharedSecrets[0])
+	mac.Write(encrypted)
+	copy(header.MAC[:], mac.Sum(nil))
 
-	// HMAC
-	_, macKey, _ := deriveKeys(secrets[0])
-	buf := new(bytes.Buffer)
-	buf.WriteByte(header.Version)
-	buf.Write(header.EphKey[:])
-	binary.Write(buf, binary.BigEndian, uint32(len(header.Routing)))
-	buf.Write(header.Routing)
-	copy(header.MAC[:], computeMAC(buf.Bytes(), macKey))
-
-	dbg("Sphinx packet created: header=%d bytes, payload=%d bytes", 
-		1+32+4+len(header.Routing)+32, len(payload))
-
-	return &SphinxPacket{Header: header, Payload: payload}, nil
+	return &SphinxPacket{
+		Header:  header,
+		Payload: encrypted,
+	}, nil
 }
 
-func serializeHeader(h *SphinxHeader) []byte {
-	buf := new(bytes.Buffer)
-	buf.WriteByte(h.Version)
-	buf.Write(h.EphKey[:])
-	binary.Write(buf, binary.BigEndian, uint32(len(h.Routing)))
-	buf.Write(h.Routing)
-	buf.Write(h.MAC[:])
-	return buf.Bytes()
-}
-
-func deserializeHeader(data []byte) (*SphinxHeader, error) {
-	if len(data) < 37 {
-		return nil, errors.New("header too short")
-	}
-
-	h := &SphinxHeader{Version: data[0]}
-	copy(h.EphKey[:], data[1:33])
-
-	routeLen := binary.BigEndian.Uint32(data[33:37])
-	if routeLen > 10240 {
-		return nil, errors.New("routing too large")
-	}
-	if len(data) < 37+int(routeLen)+32 {
-		return nil, errors.New("incomplete header")
-	}
-
-	h.Routing = data[37 : 37+routeLen]
-	copy(h.MAC[:], data[37+routeLen:37+routeLen+32])
-
-	return h, nil
-}
-
-// ============================================================================
-// SPHINX PROCESSING
-// ============================================================================
-
-func processPacket(pkt *SphinxPacket) {
-	atomic.AddInt64(&stats.MixRecv, 1)
-
-	dbg("Processing Sphinx packet")
-	dbg("EphKey: %x", pkt.Header.EphKey[:8])
-
-	// Random delay
-	delay := secureDelay()
-	dbg("Delay: %s", delay)
-	time.Sleep(delay)
-
-	// Derive shared secret
-	shared, err := curve25519.X25519(local.Private, pkt.Header.EphKey[:])
+func processSphinxPacket(packet *SphinxPacket) (*RoutingInfo, []byte, error) {
+	shared, err := curve25519.X25519(localNode.Private, packet.Header.EphKey[:])
 	if err != nil {
-		log.Printf("[SPHINX] shared secret failed: %v", err)
-		return
-	}
-	dbg("Shared secret derived")
-
-	encKey, macKey, _ := deriveKeys(shared)
-
-	// Verify HMAC if present
-	isZeroMAC := true
-	for _, b := range pkt.Header.MAC {
-		if b != 0 {
-			isZeroMAC = false
-			break
-		}
+		return nil, nil, err
 	}
 
-	if !isZeroMAC {
-		buf := new(bytes.Buffer)
-		buf.WriteByte(pkt.Header.Version)
-		buf.Write(pkt.Header.EphKey[:])
-		binary.Write(buf, binary.BigEndian, uint32(len(pkt.Header.Routing)))
-		buf.Write(pkt.Header.Routing)
+	kdf := hkdf.New(sha256.New, shared, nil, []byte("fog-sphinx-v2"))
+	key := make([]byte, AESKeySize)
+	kdf.Read(key)
 
-		if !verifyMAC(buf.Bytes(), pkt.Header.MAC[:], macKey) {
-			log.Printf("[SPHINX] HMAC verification FAILED")
-			return
-		}
-		dbg("HMAC verified OK")
-	} else {
-		dbg("No HMAC (forwarded packet)")
+	mac := hmac.New(sha256.New, shared)
+	mac.Write(packet.Payload)
+	if !hmac.Equal(packet.Header.MAC[:], mac.Sum(nil)[:HMACSize]) {
+		return nil, nil, errors.New("HMAC verification failed")
 	}
 
-	// Decrypt payload
-	plain, err := decrypt(pkt.Payload, encKey)
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		log.Printf("[SPHINX] decrypt failed: %v", err)
-		return
+		return nil, nil, err
 	}
-	dbg("Decrypted payload: %d bytes", len(plain))
-
-	if len(plain) < 4 {
-		log.Printf("[SPHINX] payload too short")
-		return
-	}
-
-	routeLen := binary.BigEndian.Uint32(plain[:4])
-	if len(plain) < 4+int(routeLen) {
-		log.Printf("[SPHINX] invalid route length")
-		return
-	}
-
-	routeData := plain[4 : 4+routeLen]
-	innerPayload := plain[4+routeLen:]
-
-	var routing RoutingInfo
-	if err := json.Unmarshal(routeData, &routing); err != nil {
-		log.Printf("[SPHINX] route parse failed: %v", err)
-		return
-	}
-	dbg("Routing: next=%s", routing.Next)
-
-	if routing.Next == "EXIT" {
-		log.Printf("[SPHINX] EXIT node - delivering message")
-		dbg("From: %s, To: %s", routing.From, routing.To)
-
-		// UNPAD the payload to get original message
-		originalMsg, err := unpadPayload(innerPayload)
-		if err != nil {
-			log.Printf("[SPHINX] unpad failed: %v", err)
-			atomic.AddInt64(&stats.Failed, 1)
-			return
-		}
-		dbg("Unpadded message: %d bytes", len(originalMsg))
-
-		for _, to := range strings.Split(routing.To, ",") {
-			to = strings.TrimSpace(to)
-			if to == "" {
-				continue
-			}
-			if err := deliver(routing.From, to, originalMsg); err != nil {
-				log.Printf("[SPHINX] delivery FAILED %s: %v", to, err)
-				atomic.AddInt64(&stats.Failed, 1)
-			} else {
-				log.Printf("[SPHINX] SUCCESS delivered to %s", to)
-				atomic.AddInt64(&stats.Sent, 1)
-			}
-		}
-	} else {
-		log.Printf("[SPHINX] Forwarding to %s", routing.Next)
-
-		// Extract remaining ephemeral keys
-		var ephKeys [][32]byte
-		for i := 0; i+32 <= len(pkt.Header.Routing); i += 32 {
-			var k [32]byte
-			copy(k[:], pkt.Header.Routing[i:i+32])
-			ephKeys = append(ephKeys, k)
-		}
-		dbg("Remaining ephemeral keys: %d", len(ephKeys))
-
-		if len(ephKeys) == 0 {
-			log.Printf("[SPHINX] no more ephemeral keys")
-			return
-		}
-
-		newHeader := &SphinxHeader{
-			Version: 2,
-			EphKey:  ephKeys[0],
-		}
-
-		if len(ephKeys) > 1 {
-			for _, k := range ephKeys[1:] {
-				newHeader.Routing = append(newHeader.Routing, k[:]...)
-			}
-		}
-
-		newPkt := &SphinxPacket{Header: newHeader, Payload: innerPayload}
-
-		if err := sendPacket(routing.Next, newPkt); err != nil {
-			log.Printf("[SPHINX] forward FAILED: %v", err)
-		} else {
-			log.Printf("[SPHINX] Forwarded to %s", routing.Next)
-			atomic.AddInt64(&stats.MixFwd, 1)
-		}
-	}
-}
-
-func sendPacket(addr string, pkt *SphinxPacket) error {
-	dbg("Connecting to %s via Tor", addr)
-	
-	conn, err := torDialer.Dial("tcp", addr)
+	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
-	}
-	defer conn.Close()
-
-	dbg("Connected, sending packet")
-
-	// Send padded header
-	hdr := serializeHeader(pkt.Header)
-	padded := make([]byte, HeaderSize)
-	copy(padded, hdr)
-	
-	if _, err := conn.Write(padded); err != nil {
-		return fmt.Errorf("write header: %w", err)
-	}
-	if _, err := conn.Write(pkt.Payload); err != nil {
-		return fmt.Errorf("write payload: %w", err)
+		return nil, nil, err
 	}
 
-	dbg("Packet sent: header=%d, payload=%d", HeaderSize, len(pkt.Payload))
-	return nil
+	if len(packet.Payload) < NonceSize {
+		return nil, nil, errors.New("payload too short")
+	}
+
+	nonce := packet.Payload[:NonceSize]
+	ciphertext := packet.Payload[NonceSize:]
+
+	decrypted, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	routingParts := bytes.Split(packet.Header.Routing, []byte{0})
+	if len(routingParts) == 0 {
+		return nil, nil, errors.New("no routing info")
+	}
+
+	var info RoutingInfo
+	if err := json.Unmarshal(routingParts[0], &info); err != nil {
+		return nil, nil, err
+	}
+
+	if info.IsExit {
+		if len(decrypted) < 4 {
+			return nil, nil, errors.New("invalid exit payload")
+		}
+		
+		originalLen := binary.BigEndian.Uint32(decrypted[0:4])
+		if originalLen > uint32(len(decrypted)-4) {
+			return nil, nil, errors.New("invalid length")
+		}
+		
+		original := decrypted[4 : 4+originalLen]
+		
+		if debug {
+			log.Printf("[SPHINX] Exit node: extracted %d bytes from %d padded",
+				originalLen, len(decrypted))
+		}
+		
+		return &info, original, nil
+	}
+
+	newHeader := &SphinxHeader{
+		Version: packet.Header.Version,
+		EphKey:  packet.Header.EphKey,
+		Routing: bytes.Join(routingParts[1:], []byte{0}),
+	}
+	copy(newHeader.MAC[:], packet.Header.MAC[:])
+
+	newPacket := &SphinxPacket{
+		Header:  newHeader,
+		Payload: decrypted,
+	}
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(newPacket)
+
+	return &info, buf.Bytes(), nil
 }
 
 // ============================================================================
-// NODE SERVER (receives Sphinx packets)
+// BATCH MIXING
 // ============================================================================
 
-func startNodeServer(addr string) error {
+func (b *Batch) Add(packet *SphinxPacket) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.packets) == 0 {
+		b.start = time.Now()
+	}
+
+	b.packets = append(b.packets, packet)
+
+	if len(b.packets) >= BatchSize {
+		go b.Flush()
+	}
+}
+
+func (b *Batch) Flush() {
+	b.mu.Lock()
+	if len(b.packets) == 0 {
+		b.mu.Unlock()
+		return
+	}
+
+	toSend := b.packets
+	b.packets = make([]*SphinxPacket, 0)
+	b.mu.Unlock()
+
+	for i := len(toSend) - 1; i > 0; i-- {
+		j := int(secureRandInt64(int64(i + 1)))
+		toSend[i], toSend[j] = toSend[j], toSend[i]
+	}
+
+	for _, packet := range toSend {
+		go forwardSphinxPacket(packet)
+	}
+
+	atomic.AddInt64(&stats.MixFwd, int64(len(toSend)))
+}
+
+func (b *Batch) AutoFlush() {
+	ticker := time.NewTicker(BatchWindow)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		b.Flush()
+	}
+}
+
+// ============================================================================
+// SMTP SERVER
+// ============================================================================
+
+func smtpServer(addr string) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
-
-	log.Printf("[NODE] Sphinx server on %s", addr)
-
-	go func() {
-		defer wg.Done()
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					continue
-				}
-			}
-			go handleNode(conn)
-		}
-	}()
-
-	return nil
-}
-
-func handleNode(conn net.Conn) {
-	defer conn.Close()
-	
-	remote := conn.RemoteAddr().String()
-	dbg("Node connection from %s", remote)
-
-	hdrBuf := make([]byte, HeaderSize)
-	if _, err := io.ReadFull(conn, hdrBuf); err != nil {
-		if err != io.EOF {
-			dbg("Header read failed from %s: %v", remote, err)
-		}
-		return
-	}
-
-	hdr, err := deserializeHeader(hdrBuf)
-	if err != nil {
-		log.Printf("[NODE] header parse failed: %v", err)
-		return
-	}
-
-	payload, err := io.ReadAll(conn)
-	if err != nil {
-		log.Printf("[NODE] payload read failed: %v", err)
-		return
-	}
-
-	dbg("Received packet: header parsed, payload=%d bytes", len(payload))
-	batch.Add(&SphinxPacket{Header: hdr, Payload: payload})
-	log.Printf("[NODE] Packet received and batched")
-}
-
-// ============================================================================
-// SMTP SERVER (entry point)
-// ============================================================================
-
-func startSMTP(addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
+	defer ln.Close()
 
 	log.Printf("[SMTP] Listening on %s", addr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			default:
-				continue
-			}
+			continue
 		}
 		go handleSMTP(conn)
 	}
@@ -908,11 +949,11 @@ func handleSMTP(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	fmt.Fprintf(writer, "220 %s fog/%s\r\n", hostname, Version)
+	writer.WriteString("220 fog SMTP Ready\r\n")
 	writer.Flush()
 
 	var from string
-	var to []string
+	var recipients []string
 	var data bytes.Buffer
 
 	for {
@@ -920,367 +961,425 @@ func handleSMTP(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		line = strings.TrimRight(line, "\r\n")
-		dbg("SMTP <- %s: %s", remote, line)
 
-		parts := strings.SplitN(line, " ", 2)
-		cmd := strings.ToUpper(parts[0])
+		line = strings.TrimSpace(line)
+		cmd := strings.ToUpper(strings.Fields(line)[0])
+
+		if debug {
+			log.Printf("[SMTP] <- %s: %s", remote, line)
+		}
 
 		switch cmd {
 		case "EHLO", "HELO":
-			fmt.Fprintf(writer, "250-%s\r\n250-SIZE %d\r\n250 8BITMIME\r\n", hostname, MaxMsgSize)
-			dbg("SMTP -> EHLO response")
+			writer.WriteString("250 Hello\r\n")
 
 		case "MAIL":
-			if !strings.HasPrefix(strings.ToUpper(line), "MAIL FROM:") {
-				fmt.Fprintf(writer, "501 Syntax\r\n")
-				writer.Flush()
-				continue
-			}
-			addr := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-			if idx := strings.Index(addr, " "); idx != -1 {
-				addr = addr[:idx]
-			}
-			from = strings.Trim(addr, "<>")
-			to = nil
-			fmt.Fprintf(writer, "250 OK\r\n")
-			dbg("MAIL FROM: %s", from)
+			from = extractEmail(line)
+			writer.WriteString("250 OK\r\n")
 
 		case "RCPT":
-			if from == "" {
-				fmt.Fprintf(writer, "503 MAIL first\r\n")
-				writer.Flush()
-				continue
-			}
-			if len(to) >= MaxRecipient {
-				fmt.Fprintf(writer, "452 Too many\r\n")
-				writer.Flush()
-				continue
-			}
-			if !strings.HasPrefix(strings.ToUpper(line), "RCPT TO:") {
-				fmt.Fprintf(writer, "501 Syntax\r\n")
-				writer.Flush()
-				continue
-			}
-			addr := strings.Trim(strings.TrimSpace(strings.SplitN(line, ":", 2)[1]), "<>")
-			if addr == "" {
-				fmt.Fprintf(writer, "501 Invalid\r\n")
-				writer.Flush()
-				continue
-			}
-			to = append(to, addr)
-			fmt.Fprintf(writer, "250 OK\r\n")
-			dbg("RCPT TO: %s", addr)
+			to := extractEmail(line)
+			recipients = append(recipients, to)
+			writer.WriteString("250 OK\r\n")
 
 		case "DATA":
-			if from == "" || len(to) == 0 {
-				fmt.Fprintf(writer, "503 MAIL/RCPT first\r\n")
-				writer.Flush()
-				continue
-			}
-
-			fmt.Fprintf(writer, "354 End with .\r\n")
+			writer.WriteString("354 End data with <CR><LF>.<CR><LF>\r\n")
 			writer.Flush()
 
-			data.Reset()
 			for {
 				line, err := reader.ReadString('\n')
 				if err != nil {
 					return
 				}
-				// FIX: Accept both .\r\n and .\n
-				if line == ".\r\n" || line == ".\n" {
+				if line == ".\r\n" {
 					break
 				}
-				if strings.HasPrefix(line, "..") {
-					line = line[1:]
-				}
 				data.WriteString(line)
-				if data.Len() > MaxMsgSize {
-					fmt.Fprintf(writer, "552 Too large\r\n")
-					writer.Flush()
-					return
-				}
 			}
 
-			id := genID()
 			msg := &Message{
-				ID:   id,
+				ID:   generateMessageID(),
 				From: from,
-				To:   to,
+				To:   recipients,
 				Data: data.Bytes(),
 				Time: time.Now(),
 			}
 
-			if !replay.Check(id) {
-				fmt.Fprintf(writer, "550 Duplicate\r\n")
-				writer.Flush()
-				continue
-			}
-
-			select {
-			case queue <- msg:
+			if enableDelay {
+				if err := delayPool.Enqueue(msg); err != nil {
+					log.Printf("[POOL] Enqueue error: %v", err)
+					writer.WriteString("451 Queue error\r\n")
+				} else {
+					writer.WriteString("250 Queued for delayed delivery\r\n")
+					atomic.AddInt64(&stats.Recv, 1)
+				}
+			} else {
+				go sendMessage(msg)
+				writer.WriteString("250 OK\r\n")
 				atomic.AddInt64(&stats.Recv, 1)
-				fmt.Fprintf(writer, "250 OK: %s\r\n", id)
-				log.Printf("[SMTP] Queued %s from %s to %d rcpt (%d bytes)", 
-					id, from, len(to), data.Len())
-			default:
-				fmt.Fprintf(writer, "452 Queue full\r\n")
 			}
 
 			from = ""
-			to = nil
-
-		case "RSET":
-			from = ""
-			to = nil
-			fmt.Fprintf(writer, "250 OK\r\n")
+			recipients = nil
+			data.Reset()
 
 		case "QUIT":
-			fmt.Fprintf(writer, "221 Bye\r\n")
+			writer.WriteString("221 Bye\r\n")
 			writer.Flush()
 			return
 
 		default:
-			fmt.Fprintf(writer, "502 Unknown\r\n")
+			writer.WriteString("500 Unknown command\r\n")
 		}
 
 		writer.Flush()
 	}
 }
 
-func genID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
+func extractEmail(line string) string {
+	start := strings.Index(line, "<")
+	end := strings.Index(line, ">")
+	if start >= 0 && end > start {
+		return line[start+1 : end]
+	}
+	parts := strings.Fields(line)
+	if len(parts) >= 2 {
+		return parts[1]
+	}
+	return ""
+}
+
+func generateMessageID() string {
+	return fmt.Sprintf("%s@fog", secureRandHex(16))
 }
 
 // ============================================================================
-// DELIVERY
+// MESSAGE SENDING
 // ============================================================================
 
-func deliver(from, to string, data []byte) error {
-	parts := strings.Split(to, "@")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid email: %s", to)
-	}
-
-	server := parts[1] + ":25"
-	dbg("Delivering to %s via %s", to, server)
-
-	conn, err := torDialer.Dial("tcp", server)
-	if err != nil {
-		return fmt.Errorf("connect: %w", err)
-	}
-	defer conn.Close()
-
-	client, err := smtp.NewClient(conn, hostname)
-	if err != nil {
-		return fmt.Errorf("smtp client: %w", err)
-	}
-	defer client.Close()
-
-	if err := client.Hello(hostname); err != nil {
-		return fmt.Errorf("EHLO: %w", err)
-	}
-	if err := client.Mail(from); err != nil {
-		return fmt.Errorf("MAIL: %w", err)
-	}
-	if err := client.Rcpt(to); err != nil {
-		return fmt.Errorf("RCPT: %w", err)
-	}
-
-	wc, err := client.Data()
-	if err != nil {
-		return fmt.Errorf("DATA: %w", err)
-	}
-	
-	if _, err := wc.Write(data); err != nil {
-		wc.Close()
-		return fmt.Errorf("write: %w", err)
-	}
-	
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("close: %w", err)
-	}
-
-	dbg("Delivered %d bytes to %s", len(data), to)
-	return client.Quit()
-}
-
-// ============================================================================
-// WORKERS
-// ============================================================================
-
-func worker(id int) {
-	defer wg.Done()
-	log.Printf("[WORKER %d] Started", id)
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("[WORKER %d] Stopped", id)
-			return
-		case msg := <-queue:
-			processMsg(id, msg)
-		}
+func sendMessage(msg *Message) {
+	if enableSphinx {
+		sendViaSphinx(msg)
+	} else {
+		sendDirect(msg)
 	}
 }
 
-func processMsg(wid int, msg *Message) {
-	delay := secureDelay()
-	log.Printf("[WORKER %d] Processing %s (delay %s)", wid, msg.ID, delay.Round(time.Millisecond))
-	time.Sleep(delay)
+func sendViaSphinx(msg *Message) {
+	path, err := pki.RandomPath(SphinxHops)
+	if err != nil {
+		log.Printf("[SPHINX] Path error: %v", err)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
 
-	healthy := pki.HealthyCount()
-	dbg("Healthy nodes: %d (need %d for Sphinx)", healthy, SphinxHops)
+	packet, err := buildSphinxPacket(path, msg.Data)
+	if err != nil {
+		log.Printf("[SPHINX] Build error: %v", err)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
 
-	if useSphinx.Load() && healthy >= SphinxHops {
-		if err := sphinxRoute(msg); err != nil {
-			log.Printf("[WORKER %d] Sphinx failed: %v, using direct", wid, err)
-			atomic.AddInt64(&stats.Direct, 1)
-			directRoute(msg)
-		} else {
-			atomic.AddInt64(&stats.Sphinx, 1)
+	time.Sleep(secureRandDelay(MinDelay, MaxDelay))
+
+	batch.Add(packet)
+	atomic.AddInt64(&stats.Sphinx, 1)
+
+	if debug {
+		log.Printf("[SPHINX] Queued %s via %s → %s → %s",
+			msg.ID, path[0].Name, path[1].Name, path[2].Name)
+	}
+}
+
+func forwardSphinxPacket(packet *SphinxPacket) {
+	info, payload, err := processSphinxPacket(packet)
+	if err != nil {
+		log.Printf("[SPHINX] Process error: %v", err)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	if info.IsExit {
+		// Sanitize headers before delivery
+		sanitizedPayload := sanitizeHeaders(payload)
+		
+		for _, to := range extractRecipients(sanitizedPayload) {
+			if err := deliverSMTP(to, sanitizedPayload); err != nil {
+				log.Printf("[SPHINX] Delivery failed %s: %v", to, err)
+				atomic.AddInt64(&stats.Failed, 1)
+			} else {
+				if debug {
+					log.Printf("[SPHINX] Delivered to %s", to)
+				}
+				atomic.AddInt64(&stats.Sent, 1)
+			}
 		}
 	} else {
-		if useSphinx.Load() {
-			log.Printf("[WORKER %d] Not enough nodes (%d/%d), using direct", wid, healthy, SphinxHops)
-		}
-		atomic.AddInt64(&stats.Direct, 1)
-		directRoute(msg)
+		forwardToNode(info.NextHop, payload)
 	}
 }
 
-func sphinxRoute(msg *Message) error {
-	healthy := pki.GetHealthy()
-	if len(healthy) < SphinxHops {
-		return fmt.Errorf("need %d nodes, have %d", SphinxHops, len(healthy))
-	}
-
-	// Secure shuffle and select
-	secureShuffle(healthy)
-	route := healthy[:SphinxHops]
-
-	log.Printf("[SPHINX] Route: %s -> %s -> %s", route[0].Name, route[1].Name, route[2].Name)
-
-	pkt, err := createPacket(msg, route)
-	if err != nil {
-		return fmt.Errorf("create packet: %w", err)
-	}
-
-	if err := sendPacket(route[0].Address, pkt); err != nil {
-		return fmt.Errorf("send to entry: %w", err)
-	}
-
-	atomic.AddInt64(&stats.Sent, 1)
-	log.Printf("[SPHINX] SUCCESS: %s via %s", msg.ID, route[0].Name)
-	return nil
-}
-
-func directRoute(msg *Message) {
+func sendDirect(msg *Message) {
 	for _, to := range msg.To {
-		to = strings.TrimSpace(to)
-		if to == "" {
-			continue
-		}
-		if err := deliver(msg.From, to, msg.Data); err != nil {
-			log.Printf("[RELAY] FAILED %s -> %s: %v", msg.ID, to, err)
+		if err := deliverSMTP(to, msg.Data); err != nil {
+			log.Printf("[DIRECT] Delivery failed %s: %v", to, err)
 			atomic.AddInt64(&stats.Failed, 1)
 		} else {
-			log.Printf("[RELAY] SUCCESS %s -> %s", msg.ID, to)
+			if debug {
+				log.Printf("[DIRECT] Delivered to %s", to)
+			}
 			atomic.AddInt64(&stats.Sent, 1)
 		}
 	}
+	atomic.AddInt64(&stats.Direct, 1)
+}
+
+func deliverSMTP(to string, data []byte) error {
+	parts := strings.SplitN(to, "@", 2)
+	if len(parts) != 2 {
+		return errors.New("invalid recipient")
+	}
+	domain := parts[1]
+
+	host := domain + ":25"
+
+	var conn net.Conn
+	var err error
+
+	if strings.HasSuffix(domain, ".onion") {
+		dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
+		if err != nil {
+			return err
+		}
+		conn, err = dialer.Dial("tcp", host)
+	} else {
+		conn, err = net.DialTimeout("tcp", host, 30*time.Second)
+	}
+
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	client, err := smtp.NewClient(conn, domain)
+	if err != nil {
+		return err
+	}
+	defer client.Quit()
+
+	if err := client.Mail("fog@anonymous.invalid"); err != nil {
+		return err
+	}
+	if err := client.Rcpt(to); err != nil {
+		return err
+	}
+
+	w, err := client.Data()
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+
+	_, err = w.Write(data)
+	return err
+}
+
+func extractRecipients(data []byte) []string {
+	lines := bytes.Split(data, []byte("\r\n"))
+	for _, line := range lines {
+		if bytes.HasPrefix(bytes.ToLower(line), []byte("to:")) {
+			addr := strings.TrimSpace(string(line[3:]))
+			return []string{addr}
+		}
+	}
+	return []string{}
 }
 
 // ============================================================================
-// HEALTH CHECK - Checks ALL nodes, not just healthy ones
+// SPHINX NODE SERVER
+// ============================================================================
+
+func sphinxNodeServer(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+
+	log.Printf("[NODE] Listening on %s", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handleSphinxNode(conn)
+	}
+}
+
+func handleSphinxNode(conn net.Conn) {
+	defer conn.Close()
+
+	var packet SphinxPacket
+	if err := json.NewDecoder(conn).Decode(&packet); err != nil {
+		return
+	}
+
+	atomic.AddInt64(&stats.MixRecv, 1)
+
+	batch.Add(&packet)
+}
+
+func forwardToNode(addr string, payload []byte) {
+	dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
+	if err != nil {
+		return
+	}
+
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	conn.Write(payload)
+}
+
+// ============================================================================
+// HEALTH CHECKER
 // ============================================================================
 
 func healthChecker() {
-	defer wg.Done()
-	
-	// Initial check
-	time.Sleep(5 * time.Second)
-	doHealthCheck()
-	
 	ticker := time.NewTicker(HealthInterval)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			doHealthCheck()
+	for range ticker.C {
+		healthy := pki.GetHealthy()
+		log.Printf("[HEALTH] Checking %d nodes", len(pki.Nodes)-1)
+
+		for _, node := range pki.Nodes {
+			if node.ID == localNode.ID {
+				continue
+			}
+
+			go func(n *Node) {
+				if checkNode(n.Address) {
+					pki.mu.Lock()
+					n.Healthy = true
+					n.LastOK = time.Now()
+					pki.mu.Unlock()
+					
+					if debug {
+						log.Printf("[HEALTH] %s OK", n.Name)
+					}
+				} else {
+					pki.mu.Lock()
+					n.Healthy = false
+					pki.mu.Unlock()
+					
+					log.Printf("[HEALTH] %s FAILED", n.Name)
+				}
+			}(node)
+		}
+
+		time.Sleep(5 * time.Second)
+		healthy = pki.GetHealthy()
+		log.Printf("[HEALTH] Done. %d nodes healthy", len(healthy))
+	}
+}
+
+func checkNode(addr string) bool {
+	dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
+	if err != nil {
+		return false
+	}
+
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// ============================================================================
+// DELAY POOL SCHEDULER
+// ============================================================================
+
+func delayPoolScheduler() {
+	ticker := time.NewTicker(PoolInterval)
+	defer ticker.Stop()
+
+	log.Printf("[POOL] Scheduler started (check every %v)", PoolInterval)
+
+	for range ticker.C {
+		messages, err := delayPool.GetReady()
+		if err != nil {
+			log.Printf("[POOL] GetReady error: %v", err)
+			continue
+		}
+
+		if len(messages) == 0 {
+			continue
+		}
+
+		log.Printf("[POOL] Processing %d ready messages", len(messages))
+
+		for _, qmsg := range messages {
+			go func(m *QueuedMessage) {
+				msg := &Message{
+					ID:   m.ID,
+					From: m.From,
+					To:   []string{m.To},
+					Data: m.Data,
+					Time: m.EnqueueTime,
+				}
+
+				sendMessage(msg)
+
+				if err := delayPool.Delete(m.ID); err != nil {
+					log.Printf("[POOL] Delete error: %v", err)
+				} else {
+					if debug {
+						waited := time.Since(m.EnqueueTime)
+						log.Printf("[POOL] Sent %s after %v delay", m.ID, waited.Round(time.Second))
+					}
+				}
+			}(qmsg)
 		}
 	}
 }
 
-func doHealthCheck() {
-	nodes := pki.GetAllOther()
-	log.Printf("[HEALTH] Checking %d nodes", len(nodes))
-
-	var wgCheck sync.WaitGroup
-	for _, n := range nodes {
-		wgCheck.Add(1)
-		go func(node *Node) {
-			defer wgCheck.Done()
-			checkNode(node)
-		}(n)
-	}
-	wgCheck.Wait()
-	
-	log.Printf("[HEALTH] Done. %d nodes healthy", pki.HealthyCount())
-}
-
-func checkNode(n *Node) {
-	dbg("Checking %s at %s", n.Name, n.Address)
-	
-	conn, err := torDialer.Dial("tcp", n.Address)
-	if err != nil {
-		pki.mu.Lock()
-		n.Healthy = false
-		pki.mu.Unlock()
-		log.Printf("[HEALTH] %s DOWN: %v", n.Name, err)
-		return
-	}
-	conn.Close()
-
-	pki.mu.Lock()
-	n.Healthy = true
-	n.LastOK = time.Now()
-	pki.mu.Unlock()
-	log.Printf("[HEALTH] %s OK", n.Name)
-}
-
 // ============================================================================
-// STATS
+// STATS REPORTER
 // ============================================================================
 
-func statsMonitor() {
-	defer wg.Done()
+func statsReporter() {
 	ticker := time.NewTicker(StatsInterval)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			up := time.Since(stats.Start).Round(time.Second)
-			log.Printf("[STATS] Up:%s R:%d S:%d F:%d | Sphinx:%d Direct:%d | Mix R:%d F:%d | Healthy:%d",
-				up,
-				atomic.LoadInt64(&stats.Recv),
-				atomic.LoadInt64(&stats.Sent),
-				atomic.LoadInt64(&stats.Failed),
-				atomic.LoadInt64(&stats.Sphinx),
-				atomic.LoadInt64(&stats.Direct),
-				atomic.LoadInt64(&stats.MixRecv),
-				atomic.LoadInt64(&stats.MixFwd),
-				pki.HealthyCount())
+	for range ticker.C {
+		uptime := time.Since(stats.Start)
+		healthy := len(pki.GetHealthy())
+		
+		var queued int64
+		if enableDelay {
+			queued = atomic.LoadInt64(&stats.Queued)
 		}
+
+		log.Printf("[STATS] Up:%v R:%d S:%d F:%d | Sphinx:%d Direct:%d | Mix R:%d F:%d | Q:%d D:%d | Healthy:%d",
+			uptime.Round(time.Second),
+			atomic.LoadInt64(&stats.Recv),
+			atomic.LoadInt64(&stats.Sent),
+			atomic.LoadInt64(&stats.Failed),
+			atomic.LoadInt64(&stats.Sphinx),
+			atomic.LoadInt64(&stats.Direct),
+			atomic.LoadInt64(&stats.MixRecv),
+			atomic.LoadInt64(&stats.MixFwd),
+			queued,
+			atomic.LoadInt64(&stats.Delayed),
+			healthy,
+		)
 	}
 }
 
@@ -1289,152 +1388,96 @@ func statsMonitor() {
 // ============================================================================
 
 func main() {
-	name := flag.String("name", "fog.local", "Hostname (your .onion address)")
-	shortName := flag.String("short-name", "", "Short name for logs (e.g. kvara, news, mail)")
-	smtpAddr := flag.String("smtp", "127.0.0.1:2525", "SMTP listen address")
-	nodeAddr := flag.String("node", "127.0.0.1:9999", "Node listen address")
-	sphinx := flag.Bool("sphinx", false, "Enable Sphinx mixnet")
-	pkiFlag := flag.String("pki-file", "", "Path to nodes.json")
-	dataFlag := flag.String("data-dir", "./fog-data", "Data directory")
-	debug := flag.Bool("debug", false, "Enable debug logging")
-	export := flag.Bool("export-node-info", false, "Export node info for nodes.json")
-	version := flag.Bool("version", false, "Show version")
-
+	var (
+		name         = flag.String("name", "", "Node address (.onion:port)")
+		shortName    = flag.String("short-name", "", "Short name for logs")
+		smtpAddr     = flag.String("smtp", "127.0.0.1:"+DefaultPort, "SMTP listen address")
+		nodeAddr     = flag.String("node", "127.0.0.1:"+NodePort, "Sphinx node address")
+		pkiFile      = flag.String("pki-file", "", "PKI nodes.json file")
+		dataDir      = flag.String("data-dir", "fog-data", "Data directory")
+		
+		minPoolDelay = flag.Duration("min-delay", DefaultMinPoolDelay, "Minimum delay pool time")
+		maxPoolDelay = flag.Duration("max-delay", DefaultMaxPoolDelay, "Maximum delay pool time")
+		delayStrat   = flag.String("delay-strategy", "exponential", "Delay strategy: exponential, constant, poisson")
+		
+		sphinx       = flag.Bool("sphinx", false, "Enable Sphinx routing")
+		delay        = flag.Bool("delay", false, "Enable delay pool")
+		showDebug    = flag.Bool("debug", false, "Debug logging")
+		exportNode   = flag.Bool("export-node-info", false, "Export node info and exit")
+	)
+	
 	flag.Parse()
 
-	if *version {
-		fmt.Printf("fog v%s\n\n", Version)
-		fmt.Println("Security features:")
-		fmt.Println("  ✓ Curve25519 ECDH + AES-256-GCM")
-		fmt.Println("  ✓ 3-hop Sphinx mixnet")
-		fmt.Println("  ✓ crypto/rand everywhere (no math/rand)")
-		fmt.Println("  ✓ Traffic analysis resistance (batching)")
-		fmt.Println("  ✓ Timing attack resistance (random delays)")
-		fmt.Println("  ✓ Size correlation resistance (fixed payload)")
-		fmt.Println("  ✓ Replay protection (24h cache)")
-		fmt.Println("  ✓ No metadata retention")
-		fmt.Println("\nNo PKI server needed - uses local nodes.json")
-		os.Exit(0)
+	enableSphinx = *sphinx
+	enableDelay = *delay
+	debug = *showDebug
+
+	if *name == "" {
+		log.Fatal("Error: -name required")
 	}
 
-	debugMode = *debug
-	dataDir = *dataFlag
-	os.MkdirAll(dataDir, 0700)
-
-	if *export {
-		initNode(*nodeAddr)
-		
-		// Use short name if provided, otherwise use hostname
-		displayName := *shortName
-		if displayName == "" {
-			displayName = *name
-		}
-		
-		// Create properly formatted nodes.json
-		nodeInfo := map[string]interface{}{
-			"version": Version,
-			"updated": time.Now().UTC().Format(time.RFC3339),
-			"nodes": []map[string]string{
-				{
-					"node_id":    local.ID,
-					"public_key": base64.StdEncoding.EncodeToString(local.Public),
-					"address":    *name + ":9999",
-					"name":       displayName,
-					"version":    Version,
-				},
-			},
-		}
-		
-		data, _ := json.MarshalIndent(nodeInfo, "", "  ")
-		
-		// Write to nodes.json
-		if err := os.WriteFile("nodes.json", data, 0600); err != nil {
-			log.Fatalf("Failed to write nodes.json: %v", err)
-		}
-		
-		fmt.Println(string(data))
-		log.Printf("Written to nodes.json")
-		os.Exit(0)
+	if *shortName == "" {
+		log.Fatal("Error: -short-name required")
 	}
 
-	log.Printf("[FOG] Starting v%s", Version)
-	if debugMode {
-		log.Printf("[FOG] Debug mode ENABLED")
+	if err := localNode.Init(*name, *shortName); err != nil {
+		log.Fatal(err)
 	}
 
-	ctx, cancel = context.WithCancel(context.Background())
-	defer cancel()
-
-	hostname = *name
-	pkiFile = *pkiFlag
-
-	// Init
-	stats = &Stats{Start: time.Now()}
-	replay = newReplayCache()
-	batch = newBatch()
-	queue = make(chan *Message, QueueSize)
-	pki = newPKI()
-
-	initNode(*nodeAddr)
-
-	// Tor
-	dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
-	if err != nil {
-		log.Fatalf("[TOR] Failed: %v", err)
+	if *exportNode {
+		if err := localNode.ExportInfo(*name, *shortName); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("[EXPORT] Written to nodes.json")
+		return
 	}
-	torDialer = dialer
-	log.Printf("[TOR] Connected to %s", TorSocks)
 
-	useSphinx.Store(*sphinx)
+	os.MkdirAll(*dataDir, 0700)
 
-	if *sphinx {
-		log.Printf("[FOG] Sphinx mode ENABLED")
+	if enableDelay {
+		strategy := parseDelayStrategy(*delayStrat)
+		dbPath := filepath.Join(*dataDir, "messages.db")
+		
+		var err error
+		delayPool, err = NewDelayPool(dbPath, *minPoolDelay, *maxPoolDelay, strategy)
+		if err != nil {
+			log.Fatalf("[POOL] Init error: %v", err)
+		}
+		defer delayPool.Close()
+		
+		log.Printf("[POOL] Enabled: min=%v max=%v strategy=%s", 
+			*minPoolDelay, *maxPoolDelay, strategy)
+		
+		go delayPoolScheduler()
+	}
 
-		if pkiFile == "" {
-			log.Printf("[FOG] WARNING: No -pki-file specified, Sphinx will use direct relay")
-		} else {
-			if err := pki.Load(pkiFile); err != nil {
-				log.Printf("[PKI] Load failed: %v", err)
-			}
+	if enableSphinx {
+		if *pkiFile == "" {
+			log.Fatal("Error: -pki-file required with -sphinx")
+		}
+		
+		if err := pki.Load(*pkiFile); err != nil {
+			log.Fatal(err)
 		}
 
-		wg.Add(1)
 		go healthChecker()
-
-		wg.Add(1)
-		if err := startNodeServer(*nodeAddr); err != nil {
-			log.Fatalf("[NODE] Failed: %v", err)
-		}
-
-		wg.Add(1)
-		go batchWorker()
-	} else {
-		log.Printf("[FOG] Direct relay mode (no Sphinx)")
+		go batch.AutoFlush()
+		go sphinxNodeServer(*nodeAddr)
 	}
 
-	// Workers
-	for i := 0; i < Workers; i++ {
-		wg.Add(1)
-		go worker(i)
-	}
+	go replayCache.Cleanup()
+	go statsReporter()
 
-	wg.Add(1)
-	go statsMonitor()
-
-	// Signals
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		<-sig
-		log.Printf("[FOG] Shutdown signal received")
-		cancel()
+		<-sigCh
+		log.Println("[SHUTDOWN] Flushing batch...")
+		batch.Flush()
+		time.Sleep(2 * time.Second)
+		os.Exit(0)
 	}()
 
-	if err := startSMTP(*smtpAddr); err != nil {
-		log.Fatalf("[SMTP] Failed: %v", err)
-	}
-
-	wg.Wait()
-	log.Printf("[FOG] Shutdown complete")
+	smtpServer(*smtpAddr)
 }
