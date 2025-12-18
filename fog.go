@@ -1,5 +1,14 @@
-// fog v2.1.1 - Anonymous SMTP Relay with Sphinx Mixnet + Header Sanitization
-// Features: delay pool, exit node header sanitization (RFC compliant)
+// fog v3.0.4 - Anonymous SMTP Relay with Sphinx Mixnet
+// v3.0.4 fixes:
+//   - Fixed Sphinx routing: each hop gets independent ephemeral key pair
+//   - Removed broken key blinding, using per-hop fresh keys instead
+//   - Simplified packet processing
+// Previous fixes (v3.0.3):
+//   - Attempted key blinding fix (had issues with curve25519 clamping)
+// Features:
+//   - PKI Gossip: fully decentralized node discovery
+//   - Threshold Batching: pool mixing with configurable threshold
+//   - Realistic Cover Traffic: low volume, irregular timing
 // Copyright 2025 - fog Project
 
 package main
@@ -7,12 +16,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -20,920 +29,1167 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"math"
 	"math/big"
 	"net"
 	"net/smtp"
-	"net/textproto"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/proxy"
 )
 
 const (
-	Version = "2.1.1"
+	Version = "3.0.8"
 
 	TorSocks    = "127.0.0.1:9050"
-	DefaultPort = "2525"
-	NodePort    = "9999"
+	DefaultSMTP = "127.0.0.1:2525"
+	DefaultNode = "127.0.0.1:9999"
 
-	MinDelay = 500 * time.Millisecond
-	MaxDelay = 5 * time.Second
-
-	BatchWindow = 30 * time.Second
-	BatchSize   = 10
-
+	// Timing
 	HealthInterval = 3 * time.Minute
+	GossipInterval = 5 * time.Minute
 	StatsInterval  = 60 * time.Second
-	PoolInterval   = 1 * time.Minute
 
+	// Threshold Batching
+	BatchThresholdMin = 5  // Minimum packets before release
+	BatchThresholdMax = 15 // Maximum before forced release
+	BatchTimeout      = 5 * time.Minute // Max wait time
+
+	// Cover Traffic - realistic small server pattern
+	CoverMinInterval  = 30 * time.Minute  // Minimum between cover msgs
+	CoverMaxInterval  = 4 * time.Hour     // Maximum between cover msgs
+	CoverMaxPerHour   = 3                 // Never exceed this per hour
+	CoverBurstChance  = 0.1               // 10% chance of 2-3 msg burst
+
+	// Sphinx
+	MinHops    = 3
+	MaxHops    = 6
+	HeaderSize = 176  // 32 (ephPub) + 128 (routing) + 16 (MAC)
+	PayloadMax = 64 * 1024
+
+	// Limits
 	MaxMsgSize   = 10 << 20
-	MaxRecipient = 50
 	QueueSize    = 500
 	Workers      = 3
-
-	CacheSize = 10000
-	CacheTTL  = 24 * time.Hour
-
-	SphinxHops = 3
-	HeaderSize = 256
-	AESKeySize = 32
-	NonceSize  = 12
-	HMACSize   = 32
-
-	PaddedPayloadSize = 64 * 1024
-
-	DefaultMinPoolDelay = 1 * time.Hour
-	DefaultMaxPoolDelay = 24 * time.Hour
+	CacheSize    = 10000
+	CacheTTL     = 24 * time.Hour
 )
 
-// ============================================================================
-// DELAY STRATEGIES
-// ============================================================================
-
-type DelayStrategy int
-
-const (
-	DelayExponential DelayStrategy = iota
-	DelayConstant
-	DelayPoisson
-)
-
-func (d DelayStrategy) String() string {
-	switch d {
-	case DelayExponential:
-		return "exponential"
-	case DelayConstant:
-		return "constant"
-	case DelayPoisson:
-		return "poisson"
-	default:
-		return "unknown"
-	}
-}
-
-func parseDelayStrategy(s string) DelayStrategy {
-	switch strings.ToLower(s) {
-	case "constant":
-		return DelayConstant
-	case "poisson":
-		return DelayPoisson
-	default:
-		return DelayExponential
-	}
-}
-
-// ============================================================================
+// =============================================================================
 // TYPES
-// ============================================================================
-
-type Message struct {
-	ID   string
-	From string
-	To   []string
-	Data []byte
-	Time time.Time
-}
-
-type QueuedMessage struct {
-	ID          string
-	From        string
-	To          string
-	Data        []byte
-	EnqueueTime time.Time
-	SendAfter   time.Time
-	Attempts    int
-}
+// =============================================================================
 
 type Node struct {
-	ID      string `json:"node_id"`
-	PubKey  string `json:"public_key"`
-	Address string `json:"address"`
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Healthy bool   `json:"-"`
-	LastOK  time.Time `json:"-"`
-}
-
-func (n *Node) GetPubKey() ([]byte, error) {
-	return base64.StdEncoding.DecodeString(n.PubKey)
-}
-
-type PKI struct {
-	Version string  `json:"version"`
-	Updated string  `json:"updated"`
-	Nodes   []*Node `json:"nodes"`
-	mu      sync.RWMutex
+	ID        string    `json:"id"`
+	PublicKey []byte    `json:"public_key"`
+	Address   string    `json:"address"`
+	Name      string    `json:"name"`
+	Version   string    `json:"version"`
+	LastSeen  time.Time `json:"last_seen"`
+	Healthy   bool      `json:"healthy"`
 }
 
 type LocalNode struct {
-	ID        string
-	Private   []byte
-	Public    []byte
-	Address   string
-	ShortName string
-	mu        sync.RWMutex
+	ID      string
+	Public  []byte
+	Private []byte
+	Address string
+	Name    string
 }
 
-type Stats struct {
-	Start    time.Time
-	Recv     int64
-	Sent     int64
-	Failed   int64
-	Sphinx   int64
-	Direct   int64
-	MixRecv  int64
-	MixFwd   int64
-	Queued   int64
-	Delayed  int64
-}
-
-type ReplayCache struct {
-	cache map[string]time.Time
-	mu    sync.RWMutex
-}
-
-type Batch struct {
-	packets []*SphinxPacket
-	start   time.Time
-	mu      sync.Mutex
-}
-
-type SphinxHeader struct {
-	Version byte
-	EphKey  [32]byte
-	Routing []byte
-	MAC     [32]byte
+type Message struct {
+	ID         string
+	From       string
+	To         []string
+	Data       []byte
+	ReceivedAt time.Time
 }
 
 type SphinxPacket struct {
-	Header  *SphinxHeader
+	Header  []byte
 	Payload []byte
 }
 
-type RoutingInfo struct {
-	NextHop string
-	IsExit  bool
+type Stats struct {
+	Start        time.Time
+	Received     int64
+	Delivered    int64
+	Failed       int64
+	SphinxRouted int64
+	DirectRelay  int64
+	CoverSent    int64
+	GossipExch   int64
+	mu           sync.Mutex
 }
 
-type DelayPool struct {
-	db          *sql.DB
-	minDelay    time.Duration
-	maxDelay    time.Duration
-	strategy    DelayStrategy
-	mu          sync.RWMutex
-}
-
-// ============================================================================
+// =============================================================================
 // GLOBALS
-// ============================================================================
+// =============================================================================
 
 var (
-	pki         = &PKI{Nodes: make([]*Node, 0)}
-	localNode   = &LocalNode{}
-	stats       = &Stats{Start: time.Now()}
-	replayCache = &ReplayCache{cache: make(map[string]time.Time)}
-	batch       = &Batch{packets: make([]*SphinxPacket, 0)}
-	delayPool   *DelayPool
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	torDialer proxy.Dialer
 
-	enableSphinx bool
-	enableDelay  bool
-	debug        bool
+	local    LocalNode
+	hostname string
+	pkiFile  string
+	keyFile  string
+
+	pki      *PKI
+	pool     *BatchPool
+	replay   *ReplayCache
+	queue    chan *Message
+	stats    *Stats
+	cover    *CoverTraffic
+
+	useSphinx atomic.Bool
+	debugMode bool
 )
 
-// ============================================================================
-// DELAY POOL - SQLITE DATABASE
-// ============================================================================
+// =============================================================================
+// PKI WITH GOSSIP PROTOCOL
+// =============================================================================
 
-func NewDelayPool(dbPath string, minDelay, maxDelay time.Duration, strategy DelayStrategy) (*DelayPool, error) {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
-	}
-
-	schema := `
-		CREATE TABLE IF NOT EXISTS message_queue (
-			id TEXT PRIMARY KEY,
-			from_addr TEXT NOT NULL,
-			to_addr TEXT NOT NULL,
-			data BLOB NOT NULL,
-			enqueue_time INTEGER NOT NULL,
-			send_after INTEGER NOT NULL,
-			attempts INTEGER DEFAULT 0,
-			created_at INTEGER DEFAULT (strftime('%s', 'now'))
-		);
-		CREATE INDEX IF NOT EXISTS idx_send_after ON message_queue(send_after);
-	`
-	
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("create schema: %w", err)
-	}
-
-	pool := &DelayPool{
-		db:       db,
-		minDelay: minDelay,
-		maxDelay: maxDelay,
-		strategy: strategy,
-	}
-
-	return pool, nil
+type PKI struct {
+	nodes map[string]*Node
+	mu    sync.RWMutex
 }
 
-func (p *DelayPool) Close() error {
-	return p.db.Close()
+func newPKI() *PKI {
+	return &PKI{nodes: make(map[string]*Node)}
 }
 
-func (p *DelayPool) calculateDelay() time.Duration {
+func (p *PKI) Add(n *Node) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	existing, ok := p.nodes[n.ID]
+	if !ok || n.LastSeen.After(existing.LastSeen) {
+		p.nodes[n.ID] = n
+		if debugMode {
+			log.Printf("[PKI] Added/updated node %s (%s)", n.Name, n.ID[:16])
+		}
+	}
+}
+
+func (p *PKI) Remove(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.nodes, id)
+}
+
+func (p *PKI) Get(id string) *Node {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-
-	switch p.strategy {
-	case DelayConstant:
-		return p.minDelay + time.Duration(secureRandInt64(int64(p.maxDelay-p.minDelay)))
-	
-	case DelayPoisson:
-		lambda := float64(p.minDelay+p.maxDelay) / 2.0
-		delay := time.Duration(poissonRandom(lambda))
-		if delay < p.minDelay {
-			delay = p.minDelay
-		}
-		if delay > p.maxDelay {
-			delay = p.maxDelay
-		}
-		return delay
-	
-	case DelayExponential:
-		fallthrough
-	default:
-		mean := float64(p.minDelay+p.maxDelay) / 2.0
-		lambda := 1.0 / mean
-		
-		u := secureRandFloat64()
-		delay := time.Duration(-math.Log(1.0-u) / lambda)
-		
-		if delay < p.minDelay {
-			delay = p.minDelay
-		}
-		if delay > p.maxDelay {
-			delay = p.maxDelay
-		}
-		return delay
-	}
+	return p.nodes[id]
 }
 
-func (p *DelayPool) Enqueue(msg *Message) error {
-	delay := p.calculateDelay()
-	sendAfter := time.Now().Add(delay)
-	
-	for _, to := range msg.To {
-		_, err := p.db.Exec(`
-			INSERT INTO message_queue (id, from_addr, to_addr, data, enqueue_time, send_after)
-			VALUES (?, ?, ?, ?, ?, ?)`,
-			msg.ID+"-"+to,
-			msg.From,
-			to,
-			msg.Data,
-			msg.Time.Unix(),
-			sendAfter.Unix(),
-		)
-		if err != nil {
-			return fmt.Errorf("enqueue: %w", err)
-		}
+func (p *PKI) GetAll() []*Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]*Node, 0, len(p.nodes))
+	for _, n := range p.nodes {
+		result = append(result, n)
 	}
-
-	atomic.AddInt64(&stats.Queued, int64(len(msg.To)))
-	
-	if debug {
-		log.Printf("[POOL] Enqueued %s: %d recipients, delay=%v, send_after=%s",
-			msg.ID, len(msg.To), delay, sendAfter.Format("15:04:05"))
-	}
-	
-	return nil
-}
-
-func (p *DelayPool) GetReady() ([]*QueuedMessage, error) {
-	now := time.Now().Unix()
-	
-	rows, err := p.db.Query(`
-		SELECT id, from_addr, to_addr, data, enqueue_time, send_after, attempts
-		FROM message_queue
-		WHERE send_after <= ?
-		ORDER BY send_after
-		LIMIT 100`,
-		now,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var messages []*QueuedMessage
-	for rows.Next() {
-		var m QueuedMessage
-		var enqT, sendT int64
-		
-		err := rows.Scan(&m.ID, &m.From, &m.To, &m.Data, &enqT, &sendT, &m.Attempts)
-		if err != nil {
-			log.Printf("[POOL] Scan error: %v", err)
-			continue
-		}
-		
-		m.EnqueueTime = time.Unix(enqT, 0)
-		m.SendAfter = time.Unix(sendT, 0)
-		messages = append(messages, &m)
-	}
-
-	return messages, nil
-}
-
-func (p *DelayPool) Delete(id string) error {
-	_, err := p.db.Exec("DELETE FROM message_queue WHERE id = ?", id)
-	if err != nil {
-		return fmt.Errorf("delete: %w", err)
-	}
-	atomic.AddInt64(&stats.Queued, -1)
-	atomic.AddInt64(&stats.Delayed, 1)
-	return nil
-}
-
-func (p *DelayPool) IncrementAttempts(id string) error {
-	_, err := p.db.Exec("UPDATE message_queue SET attempts = attempts + 1 WHERE id = ?", id)
-	return err
-}
-
-func (p *DelayPool) Count() (int64, error) {
-	var count int64
-	err := p.db.QueryRow("SELECT COUNT(*) FROM message_queue").Scan(&count)
-	return count, err
-}
-
-func (p *DelayPool) Stats() (total, ready int64, oldest time.Time, err error) {
-	err = p.db.QueryRow("SELECT COUNT(*), MIN(send_after) FROM message_queue").Scan(&total, &oldest)
-	if err != nil {
-		return
-	}
-	
-	now := time.Now().Unix()
-	err = p.db.QueryRow("SELECT COUNT(*) FROM message_queue WHERE send_after <= ?", now).Scan(&ready)
-	return
-}
-
-// ============================================================================
-// SECURE RANDOM UTILITIES
-// ============================================================================
-
-func secureRandInt64(max int64) int64 {
-	if max <= 0 {
-		return 0
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(max))
-	if err != nil {
-		return 0
-	}
-	return n.Int64()
-}
-
-func secureRandFloat64() float64 {
-	n := secureRandInt64(1 << 53)
-	return float64(n) / float64(1<<53)
-}
-
-func poissonRandom(lambda float64) float64 {
-	L := math.Exp(-lambda)
-	k := 0.0
-	p := 1.0
-	
-	for p > L {
-		k++
-		p *= secureRandFloat64()
-	}
-	
-	return k - 1.0
-}
-
-func secureRandDelay(min, max time.Duration) time.Duration {
-	if max <= min {
-		return min
-	}
-	delta := int64(max - min)
-	return min + time.Duration(secureRandInt64(delta))
-}
-
-func secureRandBytes(n int) ([]byte, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-func secureRandHex(n int) string {
-	b, _ := secureRandBytes(n)
-	return hex.EncodeToString(b)
-}
-
-// ============================================================================
-// HEADER SANITIZATION (v2.1.1)
-// ============================================================================
-
-func sanitizeHeaders(payload []byte) []byte {
-	// Parse message
-	msg, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(payload))).ReadMIMEHeader()
-	if err != nil {
-		return payload // Can't parse, return as-is
-	}
-
-	// Find headers/body boundary
-	headerEnd := bytes.Index(payload, []byte("\r\n\r\n"))
-	if headerEnd == -1 {
-		headerEnd = bytes.Index(payload, []byte("\n\n"))
-		if headerEnd == -1 {
-			return payload
-		}
-		headerEnd += 2
-	} else {
-		headerEnd += 4
-	}
-	
-	body := payload[headerEnd:]
-
-	// Build sanitized headers
-	sanitized := make(textproto.MIMEHeader)
-
-	// REPLACE: From
-	sanitized.Set("From", fmt.Sprintf("Anonymous <anonymous@%s.fog>", localNode.ShortName))
-
-	// REPLACE: Message-ID
-	sanitized.Set("Message-ID", fmt.Sprintf("<%s@%s.fog>", secureRandHex(32), localNode.ShortName))
-
-	// REPLACE: Date (randomize ±1-2h)
-	if origDate := msg.Get("Date"); origDate != "" {
-		if t, err := time.Parse(time.RFC1123Z, origDate); err == nil {
-			offset := secureRandInt64(7200) - 3600 // ±1h in seconds
-			newDate := t.Add(time.Duration(offset) * time.Second)
-			sanitized.Set("Date", newDate.Format(time.RFC1123Z))
-		} else {
-			sanitized.Set("Date", time.Now().Format(time.RFC1123Z))
-		}
-	} else {
-		sanitized.Set("Date", time.Now().Format(time.RFC1123Z))
-	}
-
-	// KEEP: Essential headers
-	keepHeaders := []string{
-		"To", "Newsgroups", "Subject",
-		"Content-Type", "Content-Transfer-Encoding", "MIME-Version",
-		"References", "In-Reply-To", // Threading (RFC 5536)
-	}
-
-	for _, h := range keepHeaders {
-		if v := msg.Get(h); v != "" {
-			sanitized.Set(h, v)
-		}
-	}
-
-	// Rebuild message
-	var buf bytes.Buffer
-	for key, values := range sanitized {
-		for _, value := range values {
-			buf.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
-		}
-	}
-	buf.WriteString("\r\n")
-	buf.Write(body)
-
-	if debug {
-		log.Printf("[SANITIZE] Headers cleaned: From=anonymous@%s.fog", localNode.ShortName)
-	}
-
-	return buf.Bytes()
-}
-
-// ============================================================================
-// PKI MANAGEMENT
-// ============================================================================
-
-func (p *PKI) Load(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read pki: %w", err)
-	}
-
-	if err := json.Unmarshal(data, p); err != nil {
-		return fmt.Errorf("parse pki: %w", err)
-	}
-
-	p.mu.Lock()
-	for _, node := range p.Nodes {
-		node.Healthy = false
-	}
-	p.mu.Unlock()
-
-	log.Printf("[PKI] Loaded %d nodes from %s", len(p.Nodes), path)
-	return nil
+	return result
 }
 
 func (p *PKI) GetHealthy() []*Node {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-
-	var healthy []*Node
-	for _, n := range p.Nodes {
-		if n.Healthy && n.ID != localNode.ID {
-			healthy = append(healthy, n)
+	result := make([]*Node, 0)
+	for _, n := range p.nodes {
+		if n.Healthy && n.ID != local.ID {
+			result = append(result, n)
 		}
 	}
-	return healthy
+	return result
 }
 
-func (p *PKI) GetNode(id string) *Node {
+func (p *PKI) GetOthers() []*Node {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]*Node, 0)
+	for _, n := range p.nodes {
+		if n.ID != local.ID {
+			result = append(result, n)
+		}
+	}
+	return result
+}
+
+func (p *PKI) HealthyCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	count := 0
+	for _, n := range p.nodes {
+		if n.Healthy && n.ID != local.ID {
+			count++
+		}
+	}
+	return count
+}
+
+// CleanupDuplicates removes duplicate nodes with same address or name, keeping only the most recent
+func (p *PKI) CleanupDuplicates() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Group by address
+	byAddress := make(map[string][]*Node)
+	for _, n := range p.nodes {
+		byAddress[n.Address] = append(byAddress[n.Address], n)
+	}
+
+	removed := 0
+	for addr, nodes := range byAddress {
+		if len(nodes) <= 1 {
+			continue
+		}
+
+		// Find the one with most recent LastSeen
+		var newest *Node
+		for _, n := range nodes {
+			if newest == nil || n.LastSeen.After(newest.LastSeen) {
+				newest = n
+			}
+		}
+
+		// Remove all others
+		for _, n := range nodes {
+			if n.ID != newest.ID {
+				delete(p.nodes, n.ID)
+				removed++
+				if debugMode {
+					log.Printf("[PKI] Removed duplicate node %s (addr: %s, kept: %s)", n.ID[:16], addr, newest.ID[:16])
+				}
+			}
+		}
+	}
+
+	// Also group by name (for .onion hostnames)
+	byName := make(map[string][]*Node)
+	for _, n := range p.nodes {
+		if n.Name != "" {
+			byName[n.Name] = append(byName[n.Name], n)
+		}
+	}
+
+	for name, nodes := range byName {
+		if len(nodes) <= 1 {
+			continue
+		}
+
+		var newest *Node
+		for _, n := range nodes {
+			if newest == nil || n.LastSeen.After(newest.LastSeen) {
+				newest = n
+			}
+		}
+
+		for _, n := range nodes {
+			if n.ID != newest.ID {
+				delete(p.nodes, n.ID)
+				removed++
+				if debugMode {
+					log.Printf("[PKI] Removed duplicate node %s (name: %s, kept: %s)", n.ID[:16], name, newest.ID[:16])
+				}
+			}
+		}
+	}
+
+	return removed
+}
+
+func (p *PKI) SetHealth(id string, healthy bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n, ok := p.nodes[id]; ok {
+		n.Healthy = healthy
+		n.LastSeen = time.Now()
+	}
+}
+
+func (p *PKI) Load(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var nodes map[string]*Node
+	if err := json.Unmarshal(data, &nodes); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for id, n := range nodes {
+		n.ID = id
+		p.nodes[id] = n
+	}
+
+	log.Printf("[PKI] Loaded %d nodes from %s", len(nodes), path)
+	return nil
+}
+
+func (p *PKI) Save(path string) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	for _, n := range p.Nodes {
-		if n.ID == id {
-			return n
+	data, err := json.MarshalIndent(p.nodes, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0600)
+}
+
+// Gossip: export our node list for sharing
+func (p *PKI) ExportForGossip() []byte {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	data, _ := json.Marshal(p.nodes)
+	return data
+}
+
+// Gossip: merge received node list
+func (p *PKI) MergeFromGossip(data []byte) int {
+	var received map[string]*Node
+	if err := json.Unmarshal(data, &received); err != nil {
+		return 0
+	}
+
+	added := 0
+	p.mu.Lock()
+
+	for id, n := range received {
+		if id == local.ID {
+			continue // Skip ourselves
+		}
+		n.ID = id
+		existing, ok := p.nodes[id]
+		if !ok {
+			p.nodes[id] = n
+			added++
+			log.Printf("[GOSSIP] Discovered new node: %s (%s)", n.Name, id[:16])
+		} else if n.LastSeen.After(existing.LastSeen) {
+			p.nodes[id] = n
 		}
 	}
-	return nil
+
+	p.mu.Unlock()
+
+	// Cleanup duplicates after merge
+	p.CleanupDuplicates()
+
+	return added
 }
 
-func (p *PKI) RandomPath(hops int) ([]*Node, error) {
-	healthy := p.GetHealthy()
-	
-	if len(healthy) < hops {
-		return nil, fmt.Errorf("insufficient nodes: need %d, have %d", hops, len(healthy))
+// =============================================================================
+// GOSSIP PROTOCOL
+// =============================================================================
+
+func gossipWorker() {
+	defer wg.Done()
+
+	// Initial delay to let things settle
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
 	}
 
-	shuffled := make([]*Node, len(healthy))
-	copy(shuffled, healthy)
-	
-	for i := len(shuffled) - 1; i > 0; i-- {
-		j := int(secureRandInt64(int64(i + 1)))
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-	}
+	ticker := time.NewTicker(GossipInterval)
+	defer ticker.Stop()
 
-	return shuffled[:hops], nil
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			doGossipRound()
+		}
+	}
 }
 
-// ============================================================================
-// LOCAL NODE
-// ============================================================================
-
-func (n *LocalNode) Init(name, shortName string) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	private := make([]byte, 32)
-	if _, err := rand.Read(private); err != nil {
-		return err
+func doGossipRound() {
+	others := pki.GetOthers()
+	if len(others) == 0 {
+		return
 	}
 
-	public, err := curve25519.X25519(private, curve25519.Basepoint)
+	// Shuffle and pick up to 3 random nodes to gossip with
+	shuffleNodes(others)
+	count := 3
+	if len(others) < count {
+		count = len(others)
+	}
+
+	myData := pki.ExportForGossip()
+
+	for i := 0; i < count; i++ {
+		node := others[i]
+		go gossipWith(node, myData)
+	}
+}
+
+func gossipWith(node *Node, myData []byte) {
+	conn, err := dialTor(node.Address)
 	if err != nil {
-		return err
+		if debugMode {
+			log.Printf("[GOSSIP] Failed to connect to %s: %v", node.Name, err)
+		}
+		return
 	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	hash := sha256.Sum256(public)
-	n.ID = base64.RawURLEncoding.EncodeToString(hash[:])
+	// Send GOSSIP command
+	fmt.Fprintf(conn, "GOSSIP %d\r\n", len(myData))
+	conn.Write(myData)
+	conn.Write([]byte("\r\n"))
 
-	n.Private = private
-	n.Public = public
-	n.Address = name
-	n.ShortName = shortName
-
-	log.Printf("[NODE] ID=%s Address=%s Name=%s", n.ID[:16], name, shortName)
-	return nil
-}
-
-func (n *LocalNode) ExportInfo(name, shortName string) error {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-
-	info := map[string]interface{}{
-		"version": Version,
-		"updated": time.Now().UTC().Format(time.RFC3339),
-		"nodes": []map[string]string{
-			{
-				"node_id":    n.ID,
-				"public_key": base64.StdEncoding.EncodeToString(n.Public),
-				"address":    name + ":" + NodePort,
-				"name":       shortName,
-				"version":    Version,
-			},
-		},
-	}
-
-	data, err := json.MarshalIndent(info, "", "  ")
+	// Read response
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
 	if err != nil {
-		return err
+		return
 	}
 
-	return os.WriteFile("nodes.json", data, 0644)
+	if strings.HasPrefix(line, "GOSSIP ") {
+		var size int
+		fmt.Sscanf(line, "GOSSIP %d", &size)
+		if size > 0 && size < 1<<20 {
+			data := make([]byte, size)
+			io.ReadFull(reader, data)
+			added := pki.MergeFromGossip(data)
+			if added > 0 {
+				atomic.AddInt64(&stats.GossipExch, int64(added))
+			}
+		}
+	}
+
+	if debugMode {
+		log.Printf("[GOSSIP] Exchanged with %s", node.Name)
+	}
 }
 
-// ============================================================================
+// =============================================================================
+// THRESHOLD BATCH POOL
+// =============================================================================
+
+type BatchPool struct {
+	packets   []*SphinxPacket
+	addedAt   []time.Time
+	mu        sync.Mutex
+	threshold int
+}
+
+func newBatchPool() *BatchPool {
+	// Random threshold between min and max
+	threshold := BatchThresholdMin + cryptoRandInt(BatchThresholdMax-BatchThresholdMin+1)
+	return &BatchPool{
+		packets:   make([]*SphinxPacket, 0),
+		addedAt:   make([]time.Time, 0),
+		threshold: threshold,
+	}
+}
+
+func (b *BatchPool) Add(p *SphinxPacket) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.packets = append(b.packets, p)
+	b.addedAt = append(b.addedAt, time.Now())
+}
+
+func (b *BatchPool) Size() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.packets)
+}
+
+func (b *BatchPool) ShouldFlush() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.packets) == 0 {
+		return false
+	}
+
+	// Flush if threshold reached
+	if len(b.packets) >= b.threshold {
+		return true
+	}
+
+	// Flush if oldest packet exceeded timeout
+	if len(b.addedAt) > 0 && time.Since(b.addedAt[0]) > BatchTimeout {
+		return true
+	}
+
+	return false
+}
+
+func (b *BatchPool) Flush() []*SphinxPacket {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.packets) == 0 {
+		return nil
+	}
+
+	// Take all packets
+	result := b.packets
+	b.packets = make([]*SphinxPacket, 0)
+	b.addedAt = make([]time.Time, 0)
+
+	// Shuffle for unlinkability
+	shufflePackets(result)
+
+	// New random threshold for next batch
+	b.threshold = BatchThresholdMin + cryptoRandInt(BatchThresholdMax-BatchThresholdMin+1)
+
+	log.Printf("[POOL] Flushing %d packets (next threshold: %d)", len(result), b.threshold)
+	return result
+}
+
+func batchWorker() {
+	defer wg.Done()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if pool.ShouldFlush() {
+				packets := pool.Flush()
+				for _, p := range packets {
+					go processSphinxPacket(p)
+				}
+			}
+		}
+	}
+}
+
+// =============================================================================
+// COVER TRAFFIC - REALISTIC SMALL SERVER PATTERN
+// =============================================================================
+
+type CoverTraffic struct {
+	lastSent    time.Time
+	sentThisHour int
+	hourStart   time.Time
+	mu          sync.Mutex
+}
+
+func newCoverTraffic() *CoverTraffic {
+	return &CoverTraffic{
+		lastSent:  time.Now(),
+		hourStart: time.Now().Truncate(time.Hour),
+	}
+}
+
+func (c *CoverTraffic) shouldSend() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+
+	// Reset hourly counter
+	currentHour := now.Truncate(time.Hour)
+	if currentHour.After(c.hourStart) {
+		c.sentThisHour = 0
+		c.hourStart = currentHour
+	}
+
+	// Never exceed max per hour
+	if c.sentThisHour >= CoverMaxPerHour {
+		return false
+	}
+
+	// Check minimum interval
+	if time.Since(c.lastSent) < CoverMinInterval {
+		return false
+	}
+
+	// Random chance based on time since last send
+	elapsed := time.Since(c.lastSent)
+	
+	// Probability increases with time, but stays low
+	// At MinInterval: ~5% chance per check
+	// At MaxInterval: ~50% chance per check
+	maxWait := float64(CoverMaxInterval)
+	elapsedF := float64(elapsed)
+	probability := 0.05 + 0.45*(elapsedF/maxWait)
+	if probability > 0.5 {
+		probability = 0.5
+	}
+
+	if cryptoRandFloat() < probability {
+		c.lastSent = now
+		c.sentThisHour++
+		return true
+	}
+
+	return false
+}
+
+func (c *CoverTraffic) shouldBurst() bool {
+	return cryptoRandFloat() < CoverBurstChance
+}
+
+func coverWorker() {
+	defer wg.Done()
+
+	// Random initial delay (1-10 minutes)
+	initialDelay := time.Duration(60+cryptoRandInt(540)) * time.Second
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(initialDelay):
+	}
+
+	// Check every 5-15 minutes (random interval each time)
+	for {
+		interval := time.Duration(5+cryptoRandInt(10)) * time.Minute
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+			if cover.shouldSend() {
+				sendCoverMessage()
+
+				// Possible burst (2-3 messages close together)
+				if cover.shouldBurst() {
+					burstCount := 1 + cryptoRandInt(2) // 1-2 extra messages
+					for i := 0; i < burstCount; i++ {
+						// Small delay between burst messages (10-60 seconds)
+						burstDelay := time.Duration(10+cryptoRandInt(50)) * time.Second
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(burstDelay):
+							if cover.shouldSend() {
+								sendCoverMessage()
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func sendCoverMessage() {
+	healthy := pki.GetHealthy()
+	if len(healthy) < MinHops {
+		return
+	}
+
+	// Create dummy message with realistic size
+	size := 500 + cryptoRandInt(2000) // 500-2500 bytes
+	dummy := make([]byte, size)
+	rand.Read(dummy)
+
+	// Select random route
+	hopCount := MinHops + cryptoRandInt(MaxHops-MinHops+1)
+	route := selectRoute(healthy, hopCount)
+	if route == nil {
+		return
+	}
+
+	// Create and send Sphinx packet
+	packet := createSphinxPacket(dummy, route, true) // isDummy = true
+	if packet == nil {
+		return
+	}
+
+	// Send to first hop
+	if err := sendToNode(route[0], packet); err != nil {
+		if debugMode {
+			log.Printf("[COVER] Failed to send: %v", err)
+		}
+		return
+	}
+
+	atomic.AddInt64(&stats.CoverSent, 1)
+	if debugMode {
+		log.Printf("[COVER] Sent dummy message via %d hops", hopCount)
+	}
+}
+
+// =============================================================================
 // REPLAY CACHE
-// ============================================================================
+// =============================================================================
+
+type ReplayCache struct {
+	items map[string]time.Time
+	mu    sync.RWMutex
+}
+
+func newReplayCache() *ReplayCache {
+	return &ReplayCache{items: make(map[string]time.Time)}
+}
 
 func (r *ReplayCache) Check(id string) bool {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	_, exists := r.cache[id]
+	_, exists := r.items[id]
+	r.mu.RUnlock()
 	return exists
 }
 
 func (r *ReplayCache) Add(id string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.cache[id] = time.Now()
+	r.items[id] = time.Now()
+	r.mu.Unlock()
 }
 
 func (r *ReplayCache) Cleanup() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cutoff := time.Now().Add(-CacheTTL)
+	for id, t := range r.items {
+		if t.Before(cutoff) {
+			delete(r.items, id)
+		}
+	}
+}
+
+func cacheCleanupWorker() {
+	defer wg.Done()
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		r.mu.Lock()
-		now := time.Now()
-		for id, t := range r.cache {
-			if now.Sub(t) > CacheTTL {
-				delete(r.cache, id)
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			replay.Cleanup()
 		}
-		r.mu.Unlock()
 	}
 }
 
-// ============================================================================
-// SPHINX PACKET FORMAT
-// ============================================================================
+// =============================================================================
+// CRYPTO HELPERS
+// =============================================================================
 
-func buildSphinxPacket(path []*Node, payload []byte) (*SphinxPacket, error) {
-	if len(path) == 0 {
-		return nil, errors.New("empty path")
+func cryptoRandInt(max int) int {
+	if max <= 0 {
+		return 0
 	}
-
-	paddedPayload := make([]byte, PaddedPayloadSize)
-	binary.BigEndian.PutUint32(paddedPayload[0:4], uint32(len(payload)))
-	copy(paddedPayload[4:], payload)
-	
-	if len(payload)+4 < PaddedPayloadSize {
-		rand.Read(paddedPayload[4+len(payload):])
-	}
-
-	routing := make([]byte, 0, len(path)*64)
-	for i, node := range path {
-		isExit := (i == len(path)-1)
-		
-		info := &RoutingInfo{
-			NextHop: node.Address,
-			IsExit:  isExit,
-		}
-		
-		infoBytes, _ := json.Marshal(info)
-		routing = append(routing, infoBytes...)
-		routing = append(routing, 0)
-	}
-
-	ephPrivate := make([]byte, 32)
-	rand.Read(ephPrivate)
-	ephPublic, _ := curve25519.X25519(ephPrivate, curve25519.Basepoint)
-
-	encrypted := paddedPayload
-	sharedSecrets := make([][]byte, 0)
-
-	for i := len(path) - 1; i >= 0; i-- {
-		nodePubKey, err := path[i].GetPubKey()
-		if err != nil {
-			return nil, err
-		}
-
-		shared, err := curve25519.X25519(ephPrivate, nodePubKey)
-		if err != nil {
-			return nil, err
-		}
-		sharedSecrets = append([][]byte{shared}, sharedSecrets...)
-
-		kdf := hkdf.New(sha256.New, shared, nil, []byte("fog-sphinx-v2"))
-		key := make([]byte, AESKeySize)
-		kdf.Read(key)
-
-		block, err := aes.NewCipher(key)
-		if err != nil {
-			return nil, err
-		}
-		gcm, err := cipher.NewGCM(block)
-		if err != nil {
-			return nil, err
-		}
-
-		nonce := make([]byte, NonceSize)
-		rand.Read(nonce)
-
-		encrypted = gcm.Seal(nonce, nonce, encrypted, nil)
-	}
-
-	header := &SphinxHeader{
-		Version: 2,
-		Routing: routing,
-	}
-	copy(header.EphKey[:], ephPublic)
-
-	mac := hmac.New(sha256.New, sharedSecrets[0])
-	mac.Write(encrypted)
-	copy(header.MAC[:], mac.Sum(nil))
-
-	return &SphinxPacket{
-		Header:  header,
-		Payload: encrypted,
-	}, nil
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max)))
+	return int(n.Int64())
 }
 
-func processSphinxPacket(packet *SphinxPacket) (*RoutingInfo, []byte, error) {
-	shared, err := curve25519.X25519(localNode.Private, packet.Header.EphKey[:])
-	if err != nil {
-		return nil, nil, err
+func cryptoRandFloat() float64 {
+	var b [8]byte
+	rand.Read(b[:])
+	return float64(binary.BigEndian.Uint64(b[:])&0x1FFFFFFFFFFFFF) / float64(0x20000000000000)
+}
+
+func cryptoRandBytes(n int) []byte {
+	b := make([]byte, n)
+	rand.Read(b)
+	return b
+}
+
+func generateKeyPair() (pub, priv []byte) {
+	priv = make([]byte, 32)
+	rand.Read(priv)
+	pub = make([]byte, 32)
+	curve25519.ScalarBaseMult((*[32]byte)(pub), (*[32]byte)(priv))
+	return
+}
+
+func sharedSecret(priv, pub []byte) []byte {
+	shared := make([]byte, 32)
+	curve25519.ScalarMult((*[32]byte)(shared), (*[32]byte)(priv), (*[32]byte)(pub))
+	return shared
+}
+
+func deriveKeys(secret []byte) (encKey, macKey []byte) {
+	hkdfReader := hkdf.New(sha256.New, secret, nil, []byte("fog-sphinx"))
+	encKey = make([]byte, 32)
+	macKey = make([]byte, 32)
+	io.ReadFull(hkdfReader, encKey)
+	io.ReadFull(hkdfReader, macKey)
+	return
+}
+
+func computeMAC(key, data []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	return mac.Sum(nil)
+}
+
+func verifyMAC(key, data, expected []byte) bool {
+	computed := computeMAC(key, data)
+	// Truncate to same length as expected (16 bytes in Sphinx)
+	if len(expected) < len(computed) {
+		computed = computed[:len(expected)]
 	}
+	return hmac.Equal(computed, expected)
+}
 
-	kdf := hkdf.New(sha256.New, shared, nil, []byte("fog-sphinx-v2"))
-	key := make([]byte, AESKeySize)
-	kdf.Read(key)
-
-	mac := hmac.New(sha256.New, shared)
-	mac.Write(packet.Payload)
-	if !hmac.Equal(packet.Header.MAC[:], mac.Sum(nil)[:HMACSize]) {
-		return nil, nil, errors.New("HMAC verification failed")
-	}
-
+func aesEncrypt(key, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	nonce := cryptoRandBytes(gcm.NonceSize())
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
 
-	if len(packet.Payload) < NonceSize {
-		return nil, nil, errors.New("payload too short")
-	}
-
-	nonce := packet.Payload[:NonceSize]
-	ciphertext := packet.Payload[NonceSize:]
-
-	decrypted, err := gcm.Open(nil, nonce, ciphertext, nil)
+func aesDecrypt(key, ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-
-	routingParts := bytes.Split(packet.Header.Routing, []byte{0})
-	if len(routingParts) == 0 {
-		return nil, nil, errors.New("no routing info")
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
 	}
-
-	var info RoutingInfo
-	if err := json.Unmarshal(routingParts[0], &info); err != nil {
-		return nil, nil, err
+	if len(ciphertext) < gcm.NonceSize() {
+		return nil, errors.New("ciphertext too short")
 	}
-
-	if info.IsExit {
-		if len(decrypted) < 4 {
-			return nil, nil, errors.New("invalid exit payload")
-		}
-		
-		originalLen := binary.BigEndian.Uint32(decrypted[0:4])
-		if originalLen > uint32(len(decrypted)-4) {
-			return nil, nil, errors.New("invalid length")
-		}
-		
-		original := decrypted[4 : 4+originalLen]
-		
-		if debug {
-			log.Printf("[SPHINX] Exit node: extracted %d bytes from %d padded",
-				originalLen, len(decrypted))
-		}
-		
-		return &info, original, nil
-	}
-
-	newHeader := &SphinxHeader{
-		Version: packet.Header.Version,
-		EphKey:  packet.Header.EphKey,
-		Routing: bytes.Join(routingParts[1:], []byte{0}),
-	}
-	copy(newHeader.MAC[:], packet.Header.MAC[:])
-
-	newPacket := &SphinxPacket{
-		Header:  newHeader,
-		Payload: decrypted,
-	}
-
-	var buf bytes.Buffer
-	json.NewEncoder(&buf).Encode(newPacket)
-
-	return &info, buf.Bytes(), nil
+	nonce := ciphertext[:gcm.NonceSize()]
+	return gcm.Open(nil, nonce, ciphertext[gcm.NonceSize():], nil)
 }
 
-// ============================================================================
-// BATCH MIXING
-// ============================================================================
+// =============================================================================
+// SPHINX PACKET
+// =============================================================================
 
-func (b *Batch) Add(packet *SphinxPacket) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if len(b.packets) == 0 {
-		b.start = time.Now()
+func selectRoute(healthy []*Node, hopCount int) []*Node {
+	if len(healthy) < hopCount {
+		return nil
 	}
 
-	b.packets = append(b.packets, packet)
+	shuffleNodes(healthy)
+	return healthy[:hopCount]
+}
 
-	if len(b.packets) >= BatchSize {
-		go b.Flush()
+func createSphinxPacket(payload []byte, route []*Node, isDummy bool) *SphinxPacket {
+	if len(route) == 0 {
+		return nil
+	}
+
+	// Pad payload to fixed size
+	padded := padPayload(payload)
+
+	// Generate independent ephemeral key pairs for each hop
+	// Each hop gets its own fresh key pair
+	type hopInfo struct {
+		ephPub  []byte
+		ephPriv []byte
+		encKey  []byte
+		macKey  []byte
+	}
+	
+	hops := make([]hopInfo, len(route))
+	
+	for i := 0; i < len(route); i++ {
+		// Generate fresh ephemeral key pair for each hop
+		ephPub, ephPriv := generateKeyPair()
+		node := route[i]
+
+		// Compute shared secret with this node's public key
+		secret := sharedSecret(ephPriv, node.PublicKey)
+		encKey, macKey := deriveKeys(secret)
+
+		hops[i] = hopInfo{
+			ephPub:  ephPub,
+			ephPriv: ephPriv,
+			encKey:  encKey,
+			macKey:  macKey,
+		}
+
+		if debugMode {
+			log.Printf("[SPHINX-CREATE] Hop %d (%s): ephPub=%s nodePub=%s secret=%s macKey=%s",
+				i, node.Name,
+				base64.StdEncoding.EncodeToString(ephPub)[:16],
+				base64.StdEncoding.EncodeToString(node.PublicKey)[:16],
+				base64.StdEncoding.EncodeToString(secret)[:16],
+				base64.StdEncoding.EncodeToString(macKey)[:16])
+		}
+	}
+
+	// Build layers from exit to entry (reverse order)
+	// Each layer wraps the previous one
+	currentPayload := padded
+
+	for i := len(route) - 1; i >= 0; i-- {
+		hop := hops[i]
+
+		// Encrypt the current payload (which includes the next layer's header)
+		encrypted, err := aesEncrypt(hop.encKey, currentPayload)
+		if err != nil {
+			return nil
+		}
+
+		// Build routing info - just the next hop address
+		var nextHop string
+		isExit := (i == len(route)-1)
+		if isExit {
+			if isDummy {
+				nextHop = "DUMMY"
+			} else {
+				nextHop = "EXIT"
+			}
+		} else {
+			nextHop = route[i+1].Address
+		}
+
+		routingPadded := make([]byte, 128)
+		copy(routingPadded, []byte(nextHop))
+
+		// MAC over routing info
+		mac := computeMAC(hop.macKey, routingPadded)
+
+		// Header = ephemeral pubkey + routing + mac (176 bytes)
+		header := make([]byte, 0, 176)
+		header = append(header, hop.ephPub...)      // 32 bytes
+		header = append(header, routingPadded...)   // 128 bytes
+		header = append(header, mac[:16]...)        // 16 bytes
+
+		// New payload = header + encrypted previous payload
+		currentPayload = append(header, encrypted...)
+		
+		if debugMode {
+			log.Printf("[SPHINX-CREATE] Layer %d: header=%d encrypted=%d total=%d",
+				i, len(header), len(encrypted), len(currentPayload))
+		}
+	}
+
+	if debugMode {
+		log.Printf("[SPHINX-CREATE] Final: Header=%d Payload=%d", 
+			len(currentPayload[:HeaderSize]), len(currentPayload[HeaderSize:]))
+	}
+
+	return &SphinxPacket{
+		Header:  currentPayload[:HeaderSize],
+		Payload: currentPayload[HeaderSize:],
 	}
 }
 
-func (b *Batch) Flush() {
-	b.mu.Lock()
-	if len(b.packets) == 0 {
-		b.mu.Unlock()
+func processSphinxPacket(packet *SphinxPacket) {
+	if len(packet.Header) < 176 {
+		log.Printf("[SPHINX] Header too short: %d bytes", len(packet.Header))
 		return
 	}
 
-	toSend := b.packets
-	b.packets = make([]*SphinxPacket, 0)
-	b.mu.Unlock()
+	// Extract ephemeral public key
+	ephPub := packet.Header[:32]
 
-	for i := len(toSend) - 1; i > 0; i-- {
-		j := int(secureRandInt64(int64(i + 1)))
-		toSend[i], toSend[j] = toSend[j], toSend[i]
+	// Compute shared secret with our private key
+	secret := sharedSecret(local.Private, ephPub)
+	encKey, macKey := deriveKeys(secret)
+
+	// Extract and verify routing info
+	routingInfo := packet.Header[32:160]
+	receivedMAC := packet.Header[160:176]
+
+	if debugMode {
+		log.Printf("[SPHINX-RECV] ephPub=%s localPub=%s secret=%s macKey=%s",
+			base64.StdEncoding.EncodeToString(ephPub)[:16],
+			base64.StdEncoding.EncodeToString(local.Public)[:16],
+			base64.StdEncoding.EncodeToString(secret)[:16],
+			base64.StdEncoding.EncodeToString(macKey)[:16])
+		expectedMAC := computeMAC(macKey, routingInfo)
+		log.Printf("[SPHINX-RECV] receivedMAC=%s expectedMAC=%s",
+			base64.StdEncoding.EncodeToString(receivedMAC),
+			base64.StdEncoding.EncodeToString(expectedMAC[:16]))
+		log.Printf("[SPHINX-RECV] Header=%d Payload=%d", len(packet.Header), len(packet.Payload))
 	}
 
-	for _, packet := range toSend {
-		go forwardSphinxPacket(packet)
+	if !verifyMAC(macKey, routingInfo, receivedMAC) {
+		log.Printf("[SPHINX] MAC verification failed")
+		return
 	}
 
-	atomic.AddInt64(&stats.MixFwd, int64(len(toSend)))
-}
-
-func (b *Batch) AutoFlush() {
-	ticker := time.NewTicker(BatchWindow)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		b.Flush()
+	// Decrypt payload
+	if debugMode {
+		log.Printf("[SPHINX-RECV] Decrypting payload of %d bytes with encKey=%s",
+			len(packet.Payload), base64.StdEncoding.EncodeToString(encKey)[:16])
 	}
-}
-
-// ============================================================================
-// SMTP SERVER
-// ============================================================================
-
-func smtpServer(addr string) {
-	ln, err := net.Listen("tcp", addr)
+	decrypted, err := aesDecrypt(encKey, packet.Payload)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("[SPHINX] Decryption failed: %v", err)
+		return
 	}
-	defer ln.Close()
+
+	// Parse routing info to find next hop
+	// Format: "address\0nextEphPub..." or just "EXIT\0..." or "DUMMY\0..."
+	nullIdx := bytes.IndexByte(routingInfo, 0)
+	var nextHopAddr string
+	if nullIdx == -1 {
+		nextHopAddr = string(routingInfo)
+	} else {
+		nextHopAddr = string(routingInfo[:nullIdx])
+	}
+	nextHopAddr = strings.TrimSpace(nextHopAddr)
+
+	if nextHopAddr == "DUMMY" {
+		if debugMode {
+			log.Printf("[SPHINX] Discarded dummy message")
+		}
+		return
+	}
+
+	if nextHopAddr == "EXIT" {
+		deliverMessage(decrypted)
+		return
+	}
+
+	// Forward to next hop - decrypted payload contains the complete next packet
+	if len(decrypted) > HeaderSize {
+		nextPacket := &SphinxPacket{
+			Header:  decrypted[:HeaderSize],
+			Payload: decrypted[HeaderSize:],
+		}
+
+		node := pki.Get(findNodeByAddress(nextHopAddr))
+		if node != nil {
+			// Add delay before forwarding
+			delay := time.Duration(500+cryptoRandInt(2000)) * time.Millisecond
+			time.Sleep(delay)
+
+			if err := sendToNode(node, nextPacket); err != nil {
+				log.Printf("[SPHINX] Forward failed: %v", err)
+			} else if debugMode {
+				log.Printf("[SPHINX] Forwarded to %s", nextHopAddr)
+			}
+		} else {
+			log.Printf("[SPHINX] Unknown next hop: %s", nextHopAddr)
+		}
+	}
+}
+
+func findNodeByAddress(addr string) string {
+	for _, n := range pki.GetAll() {
+		if n.Address == addr {
+			return n.ID
+		}
+	}
+	return ""
+}
+
+func sendToNode(node *Node, packet *SphinxPacket) error {
+	conn, err := dialTor(node.Address)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	// Send SPHINX command
+	data := append(packet.Header, packet.Payload...)
+	fmt.Fprintf(conn, "SPHINX %d\r\n", len(data))
+	conn.Write(data)
+	conn.Write([]byte("\r\n"))
+
+	// Read response
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+
+	if !strings.HasPrefix(line, "OK") {
+		return errors.New("node rejected packet")
+	}
+
+	return nil
+}
+
+func padPayload(data []byte) []byte {
+	// Format: [4 bytes length][data][random padding to PayloadMax]
+	result := make([]byte, PayloadMax)
+	binary.BigEndian.PutUint32(result[:4], uint32(len(data)))
+	copy(result[4:], data)
+	rand.Read(result[4+len(data):])
+	return result
+}
+
+func unpadPayload(padded []byte) ([]byte, error) {
+	if len(padded) < 4 {
+		return nil, errors.New("payload too short")
+	}
+	length := binary.BigEndian.Uint32(padded[:4])
+	if int(length) > len(padded)-4 {
+		return nil, errors.New("invalid length")
+	}
+	return padded[4 : 4+length], nil
+}
+
+func deliverMessage(padded []byte) {
+	data, err := unpadPayload(padded)
+	if err != nil {
+		log.Printf("[EXIT] Unpad failed: %v", err)
+		return
+	}
+
+	// Parse message
+	msg := parseMessage(data)
+	if msg == nil {
+		log.Printf("[EXIT] Parse failed")
+		return
+	}
+
+	// Deliver via SMTP
+	if err := deliverSMTP(msg); err != nil {
+		log.Printf("[EXIT] Delivery failed: %v", err)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	atomic.AddInt64(&stats.Delivered, 1)
+	log.Printf("[EXIT] Delivered to %v", msg.To)
+}
+
+// =============================================================================
+// SMTP SERVER
+// =============================================================================
+
+func startSMTP(addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
 
 	log.Printf("[SMTP] Listening on %s", addr)
 
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
 	for {
-		conn, err := ln.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			continue
 		}
 		go handleSMTP(conn)
@@ -942,220 +1198,313 @@ func smtpServer(addr string) {
 
 func handleSMTP(conn net.Conn) {
 	defer conn.Close()
-	
-	remote := conn.RemoteAddr().String()
-	log.Printf("[SMTP] Connection from %s", remote)
+	conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writer.WriteString("220 fog SMTP Ready\r\n")
-	writer.Flush()
+	write := func(s string) {
+		writer.WriteString(s + "\r\n")
+		writer.Flush()
+	}
+
+	write(fmt.Sprintf("220 %s fog/%s", hostname, Version))
 
 	var from string
-	var recipients []string
+	var to []string
 	var data bytes.Buffer
+	inData := false
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return
 		}
-
 		line = strings.TrimSpace(line)
-		cmd := strings.ToUpper(strings.Fields(line)[0])
 
-		if debug {
-			log.Printf("[SMTP] <- %s: %s", remote, line)
+		if inData {
+			if line == "." {
+				inData = false
+				write("250 OK queued")
+
+				msg := &Message{
+					ID:         hex.EncodeToString(cryptoRandBytes(8)),
+					From:       from,
+					To:         to,
+					Data:       data.Bytes(),
+					ReceivedAt: time.Now(),
+				}
+
+				select {
+				case queue <- msg:
+					atomic.AddInt64(&stats.Received, 1)
+					log.Printf("[SMTP] Queued %s from %s to %v", msg.ID, from, to)
+				default:
+					log.Printf("[SMTP] Queue full, dropping message")
+				}
+
+				from = ""
+				to = nil
+				data.Reset()
+			} else {
+				if strings.HasPrefix(line, ".") {
+					line = line[1:]
+				}
+				data.WriteString(line + "\r\n")
+			}
+			continue
 		}
 
-		switch cmd {
-		case "EHLO", "HELO":
-			writer.WriteString("250 Hello\r\n")
+		upper := strings.ToUpper(line)
 
-		case "MAIL":
-			from = extractEmail(line)
-			writer.WriteString("250 OK\r\n")
+		switch {
+		case strings.HasPrefix(upper, "HELO"), strings.HasPrefix(upper, "EHLO"):
+			write(fmt.Sprintf("250 %s", hostname))
 
-		case "RCPT":
-			to := extractEmail(line)
-			recipients = append(recipients, to)
-			writer.WriteString("250 OK\r\n")
+		case strings.HasPrefix(upper, "MAIL FROM:"):
+			from = extractAddress(line[10:])
+			write("250 OK")
 
-		case "DATA":
-			writer.WriteString("354 End data with <CR><LF>.<CR><LF>\r\n")
-			writer.Flush()
+		case strings.HasPrefix(upper, "RCPT TO:"):
+			to = append(to, extractAddress(line[8:]))
+			write("250 OK")
 
-			for {
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					return
-				}
-				if line == ".\r\n" {
-					break
-				}
-				data.WriteString(line)
-			}
+		case upper == "DATA":
+			write("354 Start mail input")
+			inData = true
 
-			msg := &Message{
-				ID:   generateMessageID(),
-				From: from,
-				To:   recipients,
-				Data: data.Bytes(),
-				Time: time.Now(),
-			}
-
-			if enableDelay {
-				if err := delayPool.Enqueue(msg); err != nil {
-					log.Printf("[POOL] Enqueue error: %v", err)
-					writer.WriteString("451 Queue error\r\n")
-				} else {
-					writer.WriteString("250 Queued for delayed delivery\r\n")
-					atomic.AddInt64(&stats.Recv, 1)
-				}
-			} else {
-				go sendMessage(msg)
-				writer.WriteString("250 OK\r\n")
-				atomic.AddInt64(&stats.Recv, 1)
-			}
-
-			from = ""
-			recipients = nil
-			data.Reset()
-
-		case "QUIT":
-			writer.WriteString("221 Bye\r\n")
-			writer.Flush()
+		case upper == "QUIT":
+			write("221 Bye")
 			return
 
+		case upper == "RSET":
+			from = ""
+			to = nil
+			data.Reset()
+			write("250 OK")
+
+		case upper == "NOOP":
+			write("250 OK")
+
 		default:
-			writer.WriteString("500 Unknown command\r\n")
+			write("500 Unknown command")
 		}
-
-		writer.Flush()
 	}
 }
 
-func extractEmail(line string) string {
-	start := strings.Index(line, "<")
-	end := strings.Index(line, ">")
-	if start >= 0 && end > start {
-		return line[start+1 : end]
+func extractAddress(s string) string {
+	s = strings.TrimSpace(s)
+	// Handle "Display Name <email@domain>" format
+	if start := strings.Index(s, "<"); start != -1 {
+		if end := strings.Index(s, ">"); end > start {
+			return s[start+1 : end]
+		}
 	}
-	parts := strings.Fields(line)
-	if len(parts) >= 2 {
-		return parts[1]
+	// Handle "<email@domain>" format
+	if strings.HasPrefix(s, "<") && strings.HasSuffix(s, ">") {
+		return s[1 : len(s)-1]
 	}
-	return ""
+	return s
 }
 
-func generateMessageID() string {
-	return fmt.Sprintf("%s@fog", secureRandHex(16))
-}
+// =============================================================================
+// NODE SERVER (receives Sphinx packets and Gossip)
+// =============================================================================
 
-// ============================================================================
-// MESSAGE SENDING
-// ============================================================================
-
-func sendMessage(msg *Message) {
-	if enableSphinx {
-		sendViaSphinx(msg)
-	} else {
-		sendDirect(msg)
-	}
-}
-
-func sendViaSphinx(msg *Message) {
-	path, err := pki.RandomPath(SphinxHops)
+func startNodeServer(addr string) error {
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("[SPHINX] Path error: %v", err)
-		atomic.AddInt64(&stats.Failed, 1)
-		return
+		return err
 	}
 
-	packet, err := buildSphinxPacket(path, msg.Data)
-	if err != nil {
-		log.Printf("[SPHINX] Build error: %v", err)
-		atomic.AddInt64(&stats.Failed, 1)
-		return
-	}
+	log.Printf("[NODE] Listening on %s", addr)
 
-	time.Sleep(secureRandDelay(MinDelay, MaxDelay))
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
-	batch.Add(packet)
-	atomic.AddInt64(&stats.Sphinx, 1)
-
-	if debug {
-		log.Printf("[SPHINX] Queued %s via %s → %s → %s",
-			msg.ID, path[0].Name, path[1].Name, path[2].Name)
-	}
-}
-
-func forwardSphinxPacket(packet *SphinxPacket) {
-	info, payload, err := processSphinxPacket(packet)
-	if err != nil {
-		log.Printf("[SPHINX] Process error: %v", err)
-		atomic.AddInt64(&stats.Failed, 1)
-		return
-	}
-
-	if info.IsExit {
-		// Sanitize headers before delivery
-		sanitizedPayload := sanitizeHeaders(payload)
-		
-		for _, to := range extractRecipients(sanitizedPayload) {
-			if err := deliverSMTP(to, sanitizedPayload); err != nil {
-				log.Printf("[SPHINX] Delivery failed %s: %v", to, err)
-				atomic.AddInt64(&stats.Failed, 1)
-			} else {
-				if debug {
-					log.Printf("[SPHINX] Delivered to %s", to)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
 				}
-				atomic.AddInt64(&stats.Sent, 1)
+				continue
+			}
+			go handleNode(conn)
+		}
+	}()
+
+	return nil
+}
+
+func handleNode(conn net.Conn) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
+
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	line = strings.TrimSpace(line)
+
+	switch {
+	case strings.HasPrefix(line, "SPHINX "):
+		var size int
+		fmt.Sscanf(line, "SPHINX %d", &size)
+		if size > 0 && size < 1<<20 {
+			data := make([]byte, size)
+			io.ReadFull(reader, data)
+
+			if len(data) > HeaderSize {
+				packet := &SphinxPacket{
+					Header:  data[:HeaderSize],
+					Payload: data[HeaderSize:],
+				}
+				pool.Add(packet)
+				conn.Write([]byte("OK\r\n"))
 			}
 		}
-	} else {
-		forwardToNode(info.NextHop, payload)
+
+	case strings.HasPrefix(line, "GOSSIP "):
+		var size int
+		fmt.Sscanf(line, "GOSSIP %d", &size)
+		if size > 0 && size < 1<<20 {
+			data := make([]byte, size)
+			io.ReadFull(reader, data)
+			pki.MergeFromGossip(data)
+
+			// Respond with our node list
+			myData := pki.ExportForGossip()
+			fmt.Fprintf(conn, "GOSSIP %d\r\n", len(myData))
+			conn.Write(myData)
+			conn.Write([]byte("\r\n"))
+		}
+
+	case line == "PING":
+		conn.Write([]byte("PONG\r\n"))
+
+	case line == "INFO":
+		info := fmt.Sprintf("fog/%s %s %d nodes\r\n",
+			Version, local.Name, pki.HealthyCount())
+		conn.Write([]byte(info))
 	}
 }
 
-func sendDirect(msg *Message) {
-	for _, to := range msg.To {
-		if err := deliverSMTP(to, msg.Data); err != nil {
-			log.Printf("[DIRECT] Delivery failed %s: %v", to, err)
-			atomic.AddInt64(&stats.Failed, 1)
-		} else {
-			if debug {
-				log.Printf("[DIRECT] Delivered to %s", to)
-			}
-			atomic.AddInt64(&stats.Sent, 1)
+// =============================================================================
+// RELAY WORKER
+// =============================================================================
+
+func relayWorker(id int) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-queue:
+			processMessage(msg, id)
 		}
 	}
-	atomic.AddInt64(&stats.Direct, 1)
 }
 
-func deliverSMTP(to string, data []byte) error {
-	parts := strings.SplitN(to, "@", 2)
+func processMessage(msg *Message, workerID int) {
+	// Check replay
+	msgHash := hex.EncodeToString(computeMAC([]byte("replay"), msg.Data)[:16])
+	if replay.Check(msgHash) {
+		log.Printf("[WORKER %d] Replay detected: %s", workerID, msg.ID)
+		return
+	}
+	replay.Add(msgHash)
+
+	// Random delay
+	delay := time.Duration(100+cryptoRandInt(2000)) * time.Millisecond
+	time.Sleep(delay)
+
+	// Always use Sphinx routing (no direct relay fallback)
+	if !useSphinx.Load() {
+		log.Printf("[WORKER %d] Sphinx disabled, cannot route %s", workerID, msg.ID)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	healthy := pki.GetHealthy()
+	if len(healthy) < MinHops {
+		log.Printf("[WORKER %d] Not enough healthy nodes (%d < %d) for %s",
+			workerID, len(healthy), MinHops, msg.ID)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	hopCount := MinHops + cryptoRandInt(MaxHops-MinHops+1)
+	route := selectRoute(healthy, hopCount)
+	if route == nil {
+		log.Printf("[WORKER %d] Failed to select route for %s", workerID, msg.ID)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	packet := createSphinxPacket(msg.Data, route, false)
+	if packet == nil {
+		log.Printf("[WORKER %d] Failed to create Sphinx packet for %s", workerID, msg.ID)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	if err := sendToNode(route[0], packet); err != nil {
+		log.Printf("[WORKER %d] Failed to send to first hop for %s: %v", workerID, msg.ID, err)
+		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	atomic.AddInt64(&stats.SphinxRouted, 1)
+	log.Printf("[WORKER %d] Sphinx routed %s via %d hops", workerID, msg.ID, hopCount)
+}
+
+func directRelay(msg *Message) error {
+	for _, rcpt := range msg.To {
+		if err := deliverSMTP(&Message{
+			From: msg.From,
+			To:   []string{rcpt},
+			Data: msg.Data,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deliverSMTP(msg *Message) error {
+	if len(msg.To) == 0 {
+		return errors.New("no recipients")
+	}
+
+	rcpt := msg.To[0]
+	parts := strings.Split(rcpt, "@")
 	if len(parts) != 2 {
 		return errors.New("invalid recipient")
 	}
 	domain := parts[1]
 
-	host := domain + ":25"
-
-	var conn net.Conn
-	var err error
-
+	// Determine SMTP server
+	var smtpAddr string
 	if strings.HasSuffix(domain, ".onion") {
-		dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
-		if err != nil {
-			return err
-		}
-		conn, err = dialer.Dial("tcp", host)
+		smtpAddr = domain + ":25"
 	} else {
-		conn, err = net.DialTimeout("tcp", host, 30*time.Second)
+		mx, err := net.LookupMX(domain)
+		if err != nil || len(mx) == 0 {
+			smtpAddr = domain + ":25"
+		} else {
+			smtpAddr = mx[0].Host + ":25"
+		}
 	}
 
+	// Connect via Tor
+	conn, err := dialTor(smtpAddr)
 	if err != nil {
 		return err
 	}
@@ -1165,319 +1514,410 @@ func deliverSMTP(to string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer client.Quit()
+	defer client.Close()
 
-	if err := client.Mail("fog@anonymous.invalid"); err != nil {
+	// Extract bare email address from From (remove display name if present)
+	fromAddr := extractAddress(msg.From)
+	if fromAddr == "" {
+		fromAddr = msg.From
+	}
+
+	if err := client.Mail(fromAddr); err != nil {
 		return err
 	}
-	if err := client.Rcpt(to); err != nil {
+	if err := client.Rcpt(rcpt); err != nil {
 		return err
 	}
 
-	w, err := client.Data()
+	wc, err := client.Data()
 	if err != nil {
 		return err
 	}
-	defer w.Close()
 
-	_, err = w.Write(data)
-	return err
+	_, err = wc.Write(msg.Data)
+	if err != nil {
+		wc.Close()
+		return err
+	}
+
+	return wc.Close()
 }
 
-func extractRecipients(data []byte) []string {
-	lines := bytes.Split(data, []byte("\r\n"))
+func parseMessage(data []byte) *Message {
+	// Simple parser - extract From and To from headers
+	lines := strings.Split(string(data), "\n")
+	msg := &Message{Data: data}
+
 	for _, line := range lines {
-		if bytes.HasPrefix(bytes.ToLower(line), []byte("to:")) {
-			addr := strings.TrimSpace(string(line[3:]))
-			return []string{addr}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			break // End of headers
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "from:") {
+			msg.From = extractAddress(line[5:])
+		} else if strings.HasPrefix(lower, "to:") {
+			msg.To = append(msg.To, extractAddress(line[3:]))
 		}
 	}
-	return []string{}
+
+	if msg.From == "" {
+		msg.From = "anonymous@fog.local"
+	}
+
+	return msg
 }
 
-// ============================================================================
-// SPHINX NODE SERVER
-// ============================================================================
-
-func sphinxNodeServer(addr string) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer ln.Close()
-
-	log.Printf("[NODE] Listening on %s", addr)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
-		}
-		go handleSphinxNode(conn)
-	}
-}
-
-func handleSphinxNode(conn net.Conn) {
-	defer conn.Close()
-
-	var packet SphinxPacket
-	if err := json.NewDecoder(conn).Decode(&packet); err != nil {
-		return
-	}
-
-	atomic.AddInt64(&stats.MixRecv, 1)
-
-	batch.Add(&packet)
-}
-
-func forwardToNode(addr string, payload []byte) {
-	dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
-	if err != nil {
-		return
-	}
-
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	conn.Write(payload)
-}
-
-// ============================================================================
+// =============================================================================
 // HEALTH CHECKER
-// ============================================================================
+// =============================================================================
 
 func healthChecker() {
+	defer wg.Done()
+
 	ticker := time.NewTicker(HealthInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		healthy := pki.GetHealthy()
-		log.Printf("[HEALTH] Checking %d nodes", len(pki.Nodes)-1)
-
-		for _, node := range pki.Nodes {
-			if node.ID == localNode.ID {
-				continue
-			}
-
-			go func(n *Node) {
-				if checkNode(n.Address) {
-					pki.mu.Lock()
-					n.Healthy = true
-					n.LastOK = time.Now()
-					pki.mu.Unlock()
-					
-					if debug {
-						log.Printf("[HEALTH] %s OK", n.Name)
-					}
-				} else {
-					pki.mu.Lock()
-					n.Healthy = false
-					pki.mu.Unlock()
-					
-					log.Printf("[HEALTH] %s FAILED", n.Name)
-				}
-			}(node)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkAllNodes()
 		}
-
-		time.Sleep(5 * time.Second)
-		healthy = pki.GetHealthy()
-		log.Printf("[HEALTH] Done. %d nodes healthy", len(healthy))
 	}
 }
 
-func checkNode(addr string) bool {
-	dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
+func checkAllNodes() {
+	others := pki.GetOthers()
+	for _, node := range others {
+		go checkNode(node)
+	}
+}
+
+func checkNode(node *Node) {
+	conn, err := dialTor(node.Address)
 	if err != nil {
-		return false
+		pki.SetHealth(node.ID, false)
+		return
 	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
 
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
-}
-
-// ============================================================================
-// DELAY POOL SCHEDULER
-// ============================================================================
-
-func delayPoolScheduler() {
-	ticker := time.NewTicker(PoolInterval)
-	defer ticker.Stop()
-
-	log.Printf("[POOL] Scheduler started (check every %v)", PoolInterval)
-
-	for range ticker.C {
-		messages, err := delayPool.GetReady()
-		if err != nil {
-			log.Printf("[POOL] GetReady error: %v", err)
-			continue
-		}
-
-		if len(messages) == 0 {
-			continue
-		}
-
-		log.Printf("[POOL] Processing %d ready messages", len(messages))
-
-		for _, qmsg := range messages {
-			go func(m *QueuedMessage) {
-				msg := &Message{
-					ID:   m.ID,
-					From: m.From,
-					To:   []string{m.To},
-					Data: m.Data,
-					Time: m.EnqueueTime,
-				}
-
-				sendMessage(msg)
-
-				if err := delayPool.Delete(m.ID); err != nil {
-					log.Printf("[POOL] Delete error: %v", err)
-				} else {
-					if debug {
-						waited := time.Since(m.EnqueueTime)
-						log.Printf("[POOL] Sent %s after %v delay", m.ID, waited.Round(time.Second))
-					}
-				}
-			}(qmsg)
-		}
-	}
-}
-
-// ============================================================================
-// STATS REPORTER
-// ============================================================================
-
-func statsReporter() {
-	ticker := time.NewTicker(StatsInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		uptime := time.Since(stats.Start)
-		healthy := len(pki.GetHealthy())
-		
-		var queued int64
-		if enableDelay {
-			queued = atomic.LoadInt64(&stats.Queued)
-		}
-
-		log.Printf("[STATS] Up:%v R:%d S:%d F:%d | Sphinx:%d Direct:%d | Mix R:%d F:%d | Q:%d D:%d | Healthy:%d",
-			uptime.Round(time.Second),
-			atomic.LoadInt64(&stats.Recv),
-			atomic.LoadInt64(&stats.Sent),
-			atomic.LoadInt64(&stats.Failed),
-			atomic.LoadInt64(&stats.Sphinx),
-			atomic.LoadInt64(&stats.Direct),
-			atomic.LoadInt64(&stats.MixRecv),
-			atomic.LoadInt64(&stats.MixFwd),
-			queued,
-			atomic.LoadInt64(&stats.Delayed),
-			healthy,
-		)
-	}
-}
-
-// ============================================================================
-// MAIN
-// ============================================================================
-
-func main() {
-	var (
-		name         = flag.String("name", "", "Node address (.onion:port)")
-		shortName    = flag.String("short-name", "", "Short name for logs")
-		smtpAddr     = flag.String("smtp", "127.0.0.1:"+DefaultPort, "SMTP listen address")
-		nodeAddr     = flag.String("node", "127.0.0.1:"+NodePort, "Sphinx node address")
-		pkiFile      = flag.String("pki-file", "", "PKI nodes.json file")
-		dataDir      = flag.String("data-dir", "fog-data", "Data directory")
-		
-		minPoolDelay = flag.Duration("min-delay", DefaultMinPoolDelay, "Minimum delay pool time")
-		maxPoolDelay = flag.Duration("max-delay", DefaultMaxPoolDelay, "Maximum delay pool time")
-		delayStrat   = flag.String("delay-strategy", "exponential", "Delay strategy: exponential, constant, poisson")
-		
-		sphinx       = flag.Bool("sphinx", false, "Enable Sphinx routing")
-		delay        = flag.Bool("delay", false, "Enable delay pool")
-		showDebug    = flag.Bool("debug", false, "Debug logging")
-		exportNode   = flag.Bool("export-node-info", false, "Export node info and exit")
-	)
-	
-	flag.Parse()
-
-	enableSphinx = *sphinx
-	enableDelay = *delay
-	debug = *showDebug
-
-	if *name == "" {
-		log.Fatal("Error: -name required")
-	}
-
-	if *shortName == "" {
-		log.Fatal("Error: -short-name required")
-	}
-
-	if err := localNode.Init(*name, *shortName); err != nil {
-		log.Fatal(err)
-	}
-
-	if *exportNode {
-		if err := localNode.ExportInfo(*name, *shortName); err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("[EXPORT] Written to nodes.json")
+	fmt.Fprintf(conn, "PING\r\n")
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "PONG") {
+		pki.SetHealth(node.ID, false)
 		return
 	}
 
-	os.MkdirAll(*dataDir, 0700)
+	pki.SetHealth(node.ID, true)
+}
 
-	if enableDelay {
-		strategy := parseDelayStrategy(*delayStrat)
-		dbPath := filepath.Join(*dataDir, "messages.db")
-		
-		var err error
-		delayPool, err = NewDelayPool(dbPath, *minPoolDelay, *maxPoolDelay, strategy)
-		if err != nil {
-			log.Fatalf("[POOL] Init error: %v", err)
+// =============================================================================
+// STATS
+// =============================================================================
+
+func statsMonitor() {
+	defer wg.Done()
+
+	ticker := time.NewTicker(StatsInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			uptime := time.Since(stats.Start).Truncate(time.Second)
+			log.Printf("[STATS] Up:%v | R:%d D:%d F:%d | Sphinx:%d Direct:%d | Cover:%d Gossip:%d | Pool:%d Nodes:%d",
+				uptime,
+				atomic.LoadInt64(&stats.Received),
+				atomic.LoadInt64(&stats.Delivered),
+				atomic.LoadInt64(&stats.Failed),
+				atomic.LoadInt64(&stats.SphinxRouted),
+				atomic.LoadInt64(&stats.DirectRelay),
+				atomic.LoadInt64(&stats.CoverSent),
+				atomic.LoadInt64(&stats.GossipExch),
+				pool.Size(),
+				pki.HealthyCount())
 		}
-		defer delayPool.Close()
-		
-		log.Printf("[POOL] Enabled: min=%v max=%v strategy=%s", 
-			*minPoolDelay, *maxPoolDelay, strategy)
-		
-		go delayPoolScheduler()
+	}
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+func dialTor(addr string) (net.Conn, error) {
+	return torDialer.Dial("tcp", addr)
+}
+
+func shuffleNodes(nodes []*Node) {
+	for i := len(nodes) - 1; i > 0; i-- {
+		j := cryptoRandInt(i + 1)
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	}
+}
+
+func shufflePackets(packets []*SphinxPacket) {
+	for i := len(packets) - 1; i > 0; i-- {
+		j := cryptoRandInt(i + 1)
+		packets[i], packets[j] = packets[j], packets[i]
+	}
+}
+
+func initNode(addr string) {
+	var pub, priv []byte
+	var id string
+
+	// Try to load existing key
+	if keyFile != "" {
+		if data, err := os.ReadFile(keyFile); err == nil {
+			var saved struct {
+				ID      string `json:"id"`
+				Public  string `json:"public_key"`
+				Private string `json:"private_key"`
+			}
+			if err := json.Unmarshal(data, &saved); err == nil {
+				pub, _ = base64.StdEncoding.DecodeString(saved.Public)
+				priv, _ = base64.StdEncoding.DecodeString(saved.Private)
+				id = saved.ID
+				if len(pub) == 32 && len(priv) == 32 && id != "" {
+					log.Printf("[NODE] Loaded existing keypair from %s", keyFile)
+				} else {
+					pub, priv, id = nil, nil, ""
+				}
+			}
+		}
 	}
 
-	if enableSphinx {
-		if *pkiFile == "" {
-			log.Fatal("Error: -pki-file required with -sphinx")
-		}
-		
-		if err := pki.Load(*pkiFile); err != nil {
-			log.Fatal(err)
-		}
+	// Generate new key if not loaded
+	if pub == nil || priv == nil {
+		pub, priv = generateKeyPair()
+		id = hex.EncodeToString(computeMAC(pub, []byte("node-id"))[:16])
+		log.Printf("[NODE] Generated new keypair")
 
+		// Save new key
+		if keyFile != "" {
+			saved := struct {
+				ID      string `json:"id"`
+				Public  string `json:"public_key"`
+				Private string `json:"private_key"`
+			}{
+				ID:      id,
+				Public:  base64.StdEncoding.EncodeToString(pub),
+				Private: base64.StdEncoding.EncodeToString(priv),
+			}
+			if data, err := json.MarshalIndent(saved, "", "  "); err == nil {
+				if err := os.WriteFile(keyFile, data, 0400); err == nil {
+					log.Printf("[NODE] Saved keypair to %s", keyFile)
+				} else {
+					log.Printf("[NODE] Warning: failed to save keypair: %v", err)
+				}
+			}
+		}
+	}
+
+	local = LocalNode{
+		ID:      id,
+		Public:  pub,
+		Private: priv,
+		Address: addr,
+		Name:    hostname,
+	}
+
+	// Determine public address for PKI (use hostname, not local bind address)
+	publicAddr := addr
+	if hostname != "" && hostname != "fog.onion" {
+		// Extract port from addr
+		port := "9999"
+		if _, p, err := net.SplitHostPort(addr); err == nil {
+			port = p
+		}
+		publicAddr = hostname + ":" + port
+	}
+
+	// Add ourselves to PKI
+	pki.Add(&Node{
+		ID:        local.ID,
+		PublicKey: local.Public,
+		Address:   publicAddr,
+		Name:      local.Name,
+		Version:   Version,
+		LastSeen:  time.Now(),
+		Healthy:   true,
+	})
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+
+func main() {
+	smtpAddr := flag.String("smtp", DefaultSMTP, "SMTP listen address")
+	nodeAddr := flag.String("node", DefaultNode, "Node listen address")
+	name := flag.String("name", "fog.onion", "Server hostname")
+	sphinx := flag.Bool("sphinx", false, "Enable Sphinx routing")
+	pkiFlag := flag.String("pki", "", "PKI file path")
+	keyFlag := flag.String("key", "", "Node key file path (for persistent identity)")
+	debug := flag.Bool("debug", false, "Enable debug logging")
+	exportInfo := flag.Bool("export-node-info", false, "Export node info and exit")
+	version := flag.Bool("version", false, "Show version")
+
+	flag.Parse()
+
+	if *version {
+		fmt.Printf("fog v%s\n\n", Version)
+		fmt.Println("Features:")
+		fmt.Println("  - Sphinx multi-hop routing (3-6 hops)")
+		fmt.Println("  - PKI Gossip protocol (fully decentralized)")
+		fmt.Println("  - Threshold batch mixing")
+		fmt.Println("  - Realistic cover traffic")
+		fmt.Println("  - AES-256-GCM encryption")
+		fmt.Println("  - Forward secrecy (Curve25519 ECDH)")
+		os.Exit(0)
+	}
+
+	debugMode = *debug
+
+	// Initialize
+	pki = newPKI()
+	pool = newBatchPool()
+	replay = newReplayCache()
+	queue = make(chan *Message, QueueSize)
+	stats = &Stats{Start: time.Now()}
+	cover = newCoverTraffic()
+
+	hostname = *name
+	pkiFile = *pkiFlag
+	keyFile = *keyFlag
+
+	// Load PKI first (before initNode, so we know other nodes)
+	if pkiFile != "" {
+		if err := pki.Load(pkiFile); err != nil {
+			log.Printf("[PKI] Load failed: %v", err)
+		} else {
+			removed := pki.CleanupDuplicates()
+			if removed > 0 {
+				log.Printf("[PKI] Cleaned up %d duplicate nodes", removed)
+			}
+		}
+	}
+
+	initNode(*nodeAddr)
+
+	if *exportInfo {
+		// Need to initialize for export
+		hostname = *name
+		keyFile = *keyFlag
+		pki = newPKI()
+		initNode(*nodeAddr)
+		
+		info := map[string]interface{}{
+			"id":         local.ID,
+			"public_key": base64.StdEncoding.EncodeToString(local.Public),
+			"address":    fmt.Sprintf("%s:9999", *name),
+			"name":       *name,
+			"version":    Version,
+		}
+		data, _ := json.MarshalIndent(info, "", "  ")
+		fmt.Println(string(data))
+		os.Exit(0)
+	}
+
+	// Tor
+	dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
+	if err != nil {
+		log.Fatalf("[TOR] Connection failed: %v", err)
+	}
+	torDialer = dialer
+
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+
+	log.Printf("[FOG] Starting v%s", Version)
+	log.Printf("[FOG] Hostname: %s", hostname)
+
+	useSphinx.Store(*sphinx)
+
+	if *sphinx {
+		log.Printf("[FOG] Sphinx mode ENABLED")
+		log.Printf("[FOG] Batch threshold: %d-%d, Cover: %d-%.0fh interval",
+			BatchThresholdMin, BatchThresholdMax,
+			int(CoverMinInterval.Minutes()), CoverMaxInterval.Hours())
+
+		log.Printf("[PKI] Loaded %d nodes", len(pki.GetAll()))
+
+		wg.Add(1)
 		go healthChecker()
-		go batch.AutoFlush()
-		go sphinxNodeServer(*nodeAddr)
+
+		wg.Add(1)
+		if err := startNodeServer(*nodeAddr); err != nil {
+			log.Fatalf("[NODE] Failed: %v", err)
+		}
+
+		wg.Add(1)
+		go batchWorker()
+
+		wg.Add(1)
+		go gossipWorker()
+
+		wg.Add(1)
+		go coverWorker()
+	} else {
+		log.Printf("[FOG] Direct relay mode")
 	}
 
-	go replayCache.Cleanup()
-	go statsReporter()
+	// Workers
+	for i := 0; i < Workers; i++ {
+		wg.Add(1)
+		go relayWorker(i)
+	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	wg.Add(1)
+	go statsMonitor()
+
+	wg.Add(1)
+	go cacheCleanupWorker()
+
+	// Signals
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		<-sigCh
-		log.Println("[SHUTDOWN] Flushing batch...")
-		batch.Flush()
-		time.Sleep(2 * time.Second)
-		os.Exit(0)
+		<-sig
+		log.Printf("[FOG] Shutdown signal received")
+		cancel()
 	}()
 
-	smtpServer(*smtpAddr)
+	// Save PKI periodically
+	if pkiFile != "" {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					pki.Save(pkiFile)
+					return
+				case <-ticker.C:
+					pki.Save(pkiFile)
+				}
+			}
+		}()
+	}
+
+	if err := startSMTP(*smtpAddr); err != nil {
+		log.Fatalf("[SMTP] Failed: %v", err)
+	}
+
+	wg.Wait()
+
+	if pkiFile != "" {
+		pki.Save(pkiFile)
+	}
+
+	log.Printf("[FOG] Shutdown complete")
 }
