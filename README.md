@@ -2,7 +2,7 @@
 
 **fog** is a privacy-preserving SMTP relay that uses Sphinx mixnet routing to provide sender anonymity, forward secrecy, and resistance to traffic analysis. Perfect for anonymous email delivery, Usenet posting, and secure communications.
 
-[![Version](https://img.shields.io/badge/version-2.1.1-blue.svg)](https://github.com/yourusername/fog)
+[![Version](https://img.shields.io/badge/version-3.0.8-blue.svg)](https://github.com/yourusername/fog)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.21+-00ADD8.svg)](https://go.dev/)
 
