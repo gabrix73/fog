@@ -1,8 +1,8 @@
 #!/bin/bash
 # fog-client.sh - Interactive SMTP client for fog network
-# Selects random entry node and sends message
+# Selects random entry node and sends message via Tor
 
-VERSION="1.0"
+VERSION="2.0"
 
 # Colors
 RED='\033[0;31m'
@@ -13,337 +13,292 @@ BLUE='\033[0;34m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-# fog network nodes (onion addresses)
+# fog network nodes (onion SMTP addresses)
 NODES=(
-    "ej5dj774rkmfxvo3jexcmyotkq6bwgmr45dmwrbmk366lcvalnrgolad.onion:2525"  # kvara
-    "iycr4wfrdzieogdfeo7uxrj77w2vjlrhlrv3jg2ve62oe5aceqsqu7ad.onion:2525"  # dries
-    "66ehoz4ir6beuovmgt4gbpdfpmy43iuouj36dylqvkwgyp2dwpcbvjqd.onion:2525"  # mct8
-    "y3lozzcvvxgorgfofupvfmn4j2fuu3sz2sw7ha3ifpcsxjkuafllzvyd.onion:2525"  # news
-    "ejdrw3ka2mjhvsuz7uxjnzjircsdpoiu3a33g2xoywlafqetptjpqryd.onion:2525"  # pietro
+    "ej5dj774rkmfxvo3jexcmyotkq6bwgmr45dmwrbmk366lcvalnrgolad.onion 2525"   # kvara
+    "iycr4wfrdzieogdfeo7uxrj77w2vjlrhlrv3jg2ve62oe5aceqsqu7ad.onion 2525"   # dries
+    "66ehoz4ir6beuovmgt4gbpdfpmy43iuouj36dylqvkwgyp2dwpcbvjqd.onion 2525"   # mct8
+    "y3lozzcvvxgorgfofupvfmn4j2fuu3sz2sw7ha3ifpcsxjkuafllzvyd.onion 2525"   # news
+    "ejdrw3ka2mjhvsuz7uxjnzjircsdpoiu3a33g2xoywlafqetptjpqryd.onion 2525"   # pietro
 )
 
 NODE_NAMES=("kvara" "dries" "mct8" "news" "pietro")
 
-# Tor SOCKS proxy
-TOR_PROXY="127.0.0.1:9050"
-
-# Functions
 print_header() {
     echo -e "${CYAN}"
-    echo "╔═══════════════════════════════════════════════════════════╗"
-    echo "║              🌫️  fog Network Client v${VERSION}              ║"
-    echo "║         Anonymous SMTP Relay - Sphinx Mixnet             ║"
-    echo "╚═══════════════════════════════════════════════════════════╝"
+    echo "========================================================="
+    echo "  fog Network Client v${VERSION} - Anonymous SMTP Relay"
+    echo "========================================================="
     echo -e "${NC}"
 }
 
 check_dependencies() {
     local missing=0
-    
-    # Check nc (netcat)
+
     if ! command -v nc &> /dev/null; then
-        echo -e "${RED}✗ netcat not found${NC}"
-        echo "  Install: sudo apt install netcat-openbsd"
+        echo -e "${RED}[x] netcat not found (apt install netcat-openbsd)${NC}"
         missing=1
     fi
-    
-    # Check torify
+
     if ! command -v torify &> /dev/null; then
-        echo -e "${RED}✗ torify not found${NC}"
-        echo "  Install: sudo apt install tor"
+        echo -e "${RED}[x] torify not found (apt install tor)${NC}"
         missing=1
     fi
-    
-    # Check if Tor is running
-    if ! pgrep -x tor > /dev/null; then
-        echo -e "${RED}✗ Tor is not running${NC}"
-        echo "  Start: sudo systemctl start tor"
+
+    if ! pgrep -x tor > /dev/null 2>&1; then
+        echo -e "${RED}[x] Tor is not running (systemctl start tor)${NC}"
         missing=1
     fi
-    
+
     if [ $missing -eq 1 ]; then
-        echo ""
-        echo -e "${RED}Please install missing dependencies and try again.${NC}"
         exit 1
     fi
-    
-    echo -e "${GREEN}✓ All dependencies installed${NC}"
+
+    echo -e "${GREEN}[ok] Dependencies ready${NC}"
     echo ""
 }
 
+# CSPRNG node selection (not bash $RANDOM)
 select_random_node() {
-    local random_index=$((RANDOM % ${#NODES[@]}))
+    local count=${#NODES[@]}
+    local random_index
+    random_index=$(od -An -tu4 -N4 /dev/urandom | tr -d ' ')
+    random_index=$((random_index % count))
+
     SELECTED_NODE="${NODES[$random_index]}"
     SELECTED_NAME="${NODE_NAMES[$random_index]}"
-    
-    echo -e "${CYAN}Entry Node:${NC} ${MAGENTA}${SELECTED_NAME}${NC}"
-    echo -e "${CYAN}Address:${NC} ${SELECTED_NODE}"
+
+    echo -e "${CYAN}Entry node:${NC} ${MAGENTA}${SELECTED_NAME}${NC}"
     echo ""
 }
 
 read_multiline() {
     local prompt="$1"
-    local varname="$2"
-    
+
     echo -e "${YELLOW}${prompt}${NC}"
-    echo -e "${CYAN}(Press Ctrl+D when done, or enter a dot '.' on a line by itself)${NC}"
-    
-    local input=""
+    echo -e "${CYAN}(End with a single dot '.' on its own line)${NC}"
+
+    MULTILINE_RESULT=""
     local line
-    
+
     while IFS= read -r line; do
         if [ "$line" = "." ]; then
             break
         fi
-        input="${input}${line}"$'\n'
+        MULTILINE_RESULT="${MULTILINE_RESULT}${line}"$'\r\n'
     done
-    
-    eval "$varname=\$input"
-}
-
-generate_message_id() {
-    echo "<$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 32 | head -n 1)@fog-client>"
 }
 
 send_message() {
     local from="$1"
     local to="$2"
     local subject="$3"
-    local body="$4"
-    
+    local extra_headers="$4"
+    local body="$5"
+
+    local node_host node_port
+    node_host=$(echo "$SELECTED_NODE" | awk '{print $1}')
+    node_port=$(echo "$SELECTED_NODE" | awk '{print $2}')
+
     echo -e "${CYAN}Connecting to ${SELECTED_NAME} via Tor...${NC}"
-    
-    local msgid=$(generate_message_id)
-    local date=$(date -R)
-    
-    # Build SMTP conversation
+    echo ""
+
+    # SMTP conversation
+    # No Date/Message-ID/User-Agent: exit node generates sanitized ones
+    local response
+    response=$(
     {
+        sleep 2
+        echo "EHLO localhost"
         sleep 1
-        echo "EHLO fog-client"
-        sleep 0.5
         echo "MAIL FROM:<${from}>"
         sleep 0.5
         echo "RCPT TO:<${to}>"
         sleep 0.5
         echo "DATA"
         sleep 0.5
-        echo "From: ${from}"
-        echo "To: ${to}"
-        echo "Subject: ${subject}"
-        echo "Message-ID: ${msgid}"
-        echo "Date: ${date}"
-        echo "Content-Type: text/plain; charset=utf-8"
-        echo ""
-        echo -e "${body}"
-        echo "."
-        sleep 0.5
-        echo "QUIT"
-    } | torify nc ${SELECTED_NODE/:/ } 2>&1 | while IFS= read -r line; do
-        if [[ $line =~ ^[0-9]{3} ]]; then
-            echo -e "${BLUE}← ${line}${NC}"
-        else
-            echo -e "${CYAN}  ${line}${NC}"
+        printf "From: %s\r\n" "$from"
+        printf "To: %s\r\n" "$to"
+        printf "Subject: %s\r\n" "$subject"
+        printf "MIME-Version: 1.0\r\n"
+        printf "Content-Type: text/plain; charset=utf-8\r\n"
+        printf "Content-Transfer-Encoding: 8bit\r\n"
+        # Extra headers (Newsgroups, References, etc.)
+        if [ -n "$extra_headers" ]; then
+            printf "%s" "$extra_headers"
         fi
-    done
-    
-    local exit_code=${PIPESTATUS[0]}
-    
+        printf "\r\n"
+        # Body - use printf to avoid escape interpretation
+        printf "%s" "$body"
+        printf "\r\n.\r\n"
+        sleep 1
+        echo "QUIT"
+    } | torify nc -w 30 "$node_host" "$node_port" 2>/dev/null
+    )
+
+    # Show server responses
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            echo -e "${BLUE}  <- ${line}${NC}"
+        fi
+    done <<< "$response"
+
     echo ""
-    
-    if [ $exit_code -eq 0 ]; then
-        echo -e "${GREEN}✓ Message sent successfully!${NC}"
-        echo -e "${CYAN}Message-ID: ${msgid}${NC}"
+
+    if echo "$response" | grep -q "^250.*queued"; then
+        echo -e "${GREEN}[ok] Message accepted by ${SELECTED_NAME}${NC}"
+        echo -e "${CYAN}     Routing through Sphinx mixnet (3-6 hops)${NC}"
+        return 0
     else
-        echo -e "${RED}✗ Failed to send message${NC}"
+        echo -e "${RED}[fail] Message not accepted${NC}"
         return 1
     fi
 }
 
-show_summary() {
-    local from="$1"
-    local to="$2"
-    local subject="$3"
-    
-    echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}Message Summary:${NC}"
-    echo -e "  ${BLUE}From:${NC}    ${from}"
-    echo -e "  ${BLUE}To:${NC}      ${to}"
-    echo -e "  ${BLUE}Subject:${NC} ${subject}"
-    echo -e "  ${BLUE}Via:${NC}     ${SELECTED_NAME} (random entry node)"
-    echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-}
-
 interactive_mode() {
-    echo -e "${CYAN}Enter message details:${NC}"
+    echo -e "${CYAN}--- Compose Email ---${NC}"
     echo ""
-    
-    # From
-    read -p "$(echo -e ${YELLOW}From email address: ${NC})" from
-    if [ -z "$from" ]; then
-        echo -e "${RED}Error: From address required${NC}"
-        exit 1
-    fi
-    
-    # To
-    read -p "$(echo -e ${YELLOW}To email address: ${NC})" to
-    if [ -z "$to" ]; then
-        echo -e "${RED}Error: To address required${NC}"
-        exit 1
-    fi
-    
-    # Subject
-    read -p "$(echo -e ${YELLOW}Subject: ${NC})" subject
-    if [ -z "$subject" ]; then
-        subject="(no subject)"
-    fi
-    
+
+    echo -e -n "${YELLOW}From: ${NC}"
+    read -r from
+    [ -z "$from" ] && { echo -e "${RED}Error: From required${NC}"; exit 1; }
+
+    echo -e -n "${YELLOW}To: ${NC}"
+    read -r to
+    [ -z "$to" ] && { echo -e "${RED}Error: To required${NC}"; exit 1; }
+
+    echo -e -n "${YELLOW}Subject: ${NC}"
+    read -r subject
+    [ -z "$subject" ] && subject="(no subject)"
+
     echo ""
-    
-    # Body (multiline)
-    local body
-    read_multiline "Message body:" body
-    
-    if [ -z "$body" ]; then
-        echo -e "${RED}Error: Message body required${NC}"
-        exit 1
-    fi
-    
+    read_multiline "Body:"
+    local body="$MULTILINE_RESULT"
+    [ -z "$body" ] && { echo -e "${RED}Error: Body required${NC}"; exit 1; }
+
     echo ""
-    show_summary "$from" "$to" "$subject"
-    
-    # Confirm
-    read -p "$(echo -e ${YELLOW}Send message? [y/N]: ${NC})" confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${CYAN}Cancelled${NC}"
-        exit 0
-    fi
-    
+    echo -e "${YELLOW}---${NC}"
+    echo -e "  From:    ${from}"
+    echo -e "  To:      ${to}"
+    echo -e "  Subject: ${subject}"
+    echo -e "  Via:     ${SELECTED_NAME}"
+    echo -e "${YELLOW}---${NC}"
     echo ""
-    send_message "$from" "$to" "$subject" "$body"
+
+    echo -e -n "${YELLOW}Send? [y/N]: ${NC}"
+    read -r confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "Cancelled"; exit 0; }
+
+    echo ""
+    send_message "$from" "$to" "$subject" "" "$body"
 }
 
-usenet_helper() {
-    echo -e "${CYAN}Usenet Posting Helper${NC}"
+usenet_mode() {
+    echo -e "${CYAN}--- Compose Usenet Post ---${NC}"
     echo ""
-    
-    # From
-    read -p "$(echo -e ${YELLOW}From (display name): ${NC})" from_name
-    if [ -z "$from_name" ]; then
-        from_name="Anonymous"
-    fi
-    from="${from_name} <noreply@example.com>"
-    
-    # Newsgroups
-    read -p "$(echo -e ${YELLOW}Newsgroups (e.g., alt.test): ${NC})" newsgroups
-    if [ -z "$newsgroups" ]; then
-        echo -e "${RED}Error: Newsgroups required${NC}"
-        exit 1
-    fi
-    
-    # Subject
-    read -p "$(echo -e ${YELLOW}Subject: ${NC})" subject
-    if [ -z "$subject" ]; then
-        subject="(no subject)"
-    fi
-    
+
+    echo -e -n "${YELLOW}From (name): ${NC}"
+    read -r from_name
+    [ -z "$from_name" ] && from_name="Anonymous"
+
+    echo -e -n "${YELLOW}From (email) [noreply@fog.network]: ${NC}"
+    read -r from_email
+    [ -z "$from_email" ] && from_email="noreply@fog.network"
+    local from="${from_name} <${from_email}>"
+
+    echo -e -n "${YELLOW}Newsgroups (e.g. alt.test): ${NC}"
+    read -r newsgroups
+    [ -z "$newsgroups" ] && { echo -e "${RED}Error: Newsgroups required${NC}"; exit 1; }
+
+    echo -e -n "${YELLOW}Subject: ${NC}"
+    read -r subject
+    [ -z "$subject" ] && subject="(no subject)"
+
+    echo -e -n "${YELLOW}References (Message-ID to reply to, empty for new post): ${NC}"
+    read -r references
+
     echo ""
-    
-    # Body
-    local body
-    read_multiline "Post body:" body
-    
-    if [ -z "$body" ]; then
-        echo -e "${RED}Error: Post body required${NC}"
-        exit 1
+    read_multiline "Post body:"
+    local body="$MULTILINE_RESULT"
+    [ -z "$body" ] && { echo -e "${RED}Error: Body required${NC}"; exit 1; }
+
+    # Mail2news gateway - destination
+    echo ""
+    echo -e "${CYAN}Mail2news gateways:${NC}"
+    echo -e "  1) mail2news@dizum.com (clearnet via Tor)"
+    echo -e "  2) mail2news@xilb7y4kj6u6qfo45o3yk2kilfv54ffukzei3puonuqlncy7cn2afwyd.onion"
+    echo -e "  3) Custom address"
+    echo -e -n "${YELLOW}Gateway [1]: ${NC}"
+    read -r gw_choice
+
+    local to
+    case "$gw_choice" in
+        2) to="mail2news@xilb7y4kj6u6qfo45o3yk2kilfv54ffukzei3puonuqlncy7cn2afwyd.onion" ;;
+        3)
+            echo -e -n "${YELLOW}Custom gateway address: ${NC}"
+            read -r to
+            [ -z "$to" ] && { echo -e "${RED}Error: Address required${NC}"; exit 1; }
+            ;;
+        *) to="mail2news@dizum.com" ;;
+    esac
+
+    # Build extra headers (Newsgroups goes in email headers, NOT body)
+    local extra_headers
+    extra_headers=$(printf "Newsgroups: %s\r\n" "$newsgroups")
+    if [ -n "$references" ]; then
+        extra_headers="${extra_headers}$(printf "References: %s\r\n" "$references")"
     fi
-    
-    # Add Newsgroups header to body
-    local full_body="Newsgroups: ${newsgroups}"$'\n'"${body}"
-    
-    # Use mail2news gateway
-    local to="mail2news@mail2news.tcpreset.net"
-    
+
     echo ""
-    echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}Usenet Post Summary:${NC}"
-    echo -e "  ${BLUE}From:${NC}       ${from}"
-    echo -e "  ${BLUE}Newsgroups:${NC} ${newsgroups}"
-    echo -e "  ${BLUE}Subject:${NC}    ${subject}"
-    echo -e "  ${BLUE}Gateway:${NC}    ${to}"
-    echo -e "  ${BLUE}Via:${NC}        ${SELECTED_NAME} (random entry node)"
-    echo -e "${YELLOW}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}---${NC}"
+    echo -e "  From:       ${from}"
+    echo -e "  Newsgroups: ${newsgroups}"
+    echo -e "  Subject:    ${subject}"
+    [ -n "$references" ] && echo -e "  References: ${references}"
+    echo -e "  Gateway:    ${to}"
+    echo -e "  Via:        ${SELECTED_NAME}"
+    echo -e "${YELLOW}---${NC}"
     echo ""
-    
-    # Confirm
-    read -p "$(echo -e ${YELLOW}Post to Usenet? [y/N]: ${NC})" confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${CYAN}Cancelled${NC}"
-        exit 0
-    fi
-    
+
+    echo -e -n "${YELLOW}Post? [y/N]: ${NC}"
+    read -r confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "Cancelled"; exit 0; }
+
     echo ""
-    send_message "$from" "$to" "$subject" "$full_body"
+    send_message "$from" "$to" "$subject" "$extra_headers" "$body"
 }
 
 show_help() {
-    echo "Usage: $0 [OPTIONS]"
+    echo "Usage: $0 [OPTION]"
     echo ""
-    echo "Options:"
-    echo "  -h, --help       Show this help message"
-    echo "  -u, --usenet     Usenet posting mode"
-    echo "  -v, --version    Show version"
-    echo ""
-    echo "Interactive mode (default):"
-    echo "  Prompts for From, To, Subject, and Body"
-    echo "  Selects random entry node from fog network"
-    echo "  Sends message via Tor"
-    echo ""
-    echo "Examples:"
-    echo "  $0                    # Interactive email mode"
-    echo "  $0 --usenet           # Interactive Usenet posting mode"
-    echo ""
+    echo "  -e, --email    Compose email (default)"
+    echo "  -u, --usenet   Compose Usenet post"
+    echo "  -v, --version  Show version"
+    echo "  -h, --help     Show this help"
 }
 
 # Main
 main() {
     local mode="email"
-    
-    # Parse arguments
+
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            -u|--usenet)
-                mode="usenet"
-                shift
-                ;;
-            -v|--version)
-                echo "fog-client v${VERSION}"
-                exit 0
-                ;;
-            *)
-                echo "Unknown option: $1"
-                show_help
-                exit 1
-                ;;
+            -e|--email)   mode="email";  shift ;;
+            -u|--usenet)  mode="usenet"; shift ;;
+            -v|--version) echo "fog-client v${VERSION}"; exit 0 ;;
+            -h|--help)    show_help; exit 0 ;;
+            *)            echo "Unknown: $1"; show_help; exit 1 ;;
         esac
     done
-    
+
     print_header
     check_dependencies
     select_random_node
-    
-    if [ "$mode" = "usenet" ]; then
-        usenet_helper
-    else
-        interactive_mode
-    fi
+
+    case "$mode" in
+        email)  interactive_mode ;;
+        usenet) usenet_mode ;;
+    esac
 }
 
-# Run
 main "$@"
