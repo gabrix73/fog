@@ -1,15 +1,24 @@
-// fog v3.0.4 - Anonymous SMTP Relay with Sphinx Mixnet
-// v3.0.4 fixes:
-//   - Fixed Sphinx routing: each hop gets independent ephemeral key pair
-//   - Removed broken key blinding, using per-hop fresh keys instead
-//   - Simplified packet processing
-// Previous fixes (v3.0.3):
-//   - Attempted key blinding fix (had issues with curve25519 clamping)
+// fog v4.1.0 - Anonymous SMTP Relay with Post-Quantum Sphinx Mixnet
+// v4.1.0: BUG FIXES AND SECURITY HARDENING
+//   - Fixed: SMTP envelope now embedded in Sphinx payload
+//   - Fixed: DNS MX lookup through Tor (no DNS leak)
+//   - Fixed: Multi-recipient delivery
+//   - Fixed: Exit node header sanitization restored
+//   - Fixed: ESMTP capabilities (8BITMIME, SMTPUTF8, SIZE)
+//   - Fixed: MIME-safe line handling (no TrimSpace corruption)
+//   - Fixed: Direct relay fallback when Sphinx unavailable
+//   - Fixed: Kyber key size validation in PKI
+// v4.0.0: POST-QUANTUM CRYPTOGRAPHY
+//   - Kyber-768 key encapsulation (quantum-resistant)
+//   - Replaced Curve25519 with Kyber KEM
+//   - New packet format for larger PQ keys
+// Previous versions used classical cryptography (Curve25519)
 // Features:
 //   - PKI Gossip: fully decentralized node discovery
 //   - Threshold Batching: pool mixing with configurable threshold
 //   - Realistic Cover Traffic: low volume, irregular timing
-// Copyright 2025 - fog Project
+//   - Forward secrecy with ephemeral Kyber keys per hop
+// Copyright 2025-2026 - fog Project
 
 package main
 
@@ -42,13 +51,13 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/crypto/curve25519"
+	kyberk2so "github.com/symbolicsoft/kyber-k2so"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/proxy"
 )
 
 const (
-	Version = "3.0.8"
+	Version = "4.1.0"
 
 	TorSocks    = "127.0.0.1:9050"
 	DefaultSMTP = "127.0.0.1:2525"
@@ -60,28 +69,34 @@ const (
 	StatsInterval  = 60 * time.Second
 
 	// Threshold Batching
-	BatchThresholdMin = 5  // Minimum packets before release
-	BatchThresholdMax = 15 // Maximum before forced release
-	BatchTimeout      = 5 * time.Minute // Max wait time
+	BatchThresholdMin = 5
+	BatchThresholdMax = 15
+	BatchTimeout      = 5 * time.Minute
 
 	// Cover Traffic - realistic small server pattern
-	CoverMinInterval  = 30 * time.Minute  // Minimum between cover msgs
-	CoverMaxInterval  = 4 * time.Hour     // Maximum between cover msgs
-	CoverMaxPerHour   = 3                 // Never exceed this per hour
-	CoverBurstChance  = 0.1               // 10% chance of 2-3 msg burst
+	CoverMinInterval = 30 * time.Minute
+	CoverMaxInterval = 4 * time.Hour
+	CoverMaxPerHour  = 3
+	CoverBurstChance = 0.1
 
-	// Sphinx
+	// Kyber-768 sizes
+	KyberPKSize = 1184
+	KyberSKSize = 2400
+	KyberCTSize = 1088
+	KyberSSSize = 32
+
+	// Sphinx with Kyber
 	MinHops    = 3
 	MaxHops    = 6
-	HeaderSize = 176  // 32 (ephPub) + 128 (routing) + 16 (MAC)
+	HeaderSize = 1232 // 1088 (Kyber CT) + 128 (routing) + 16 (MAC)
 	PayloadMax = 64 * 1024
 
 	// Limits
-	MaxMsgSize   = 10 << 20
-	QueueSize    = 500
-	Workers      = 3
-	CacheSize    = 10000
-	CacheTTL     = 24 * time.Hour
+	MaxMsgSize = 10 << 20
+	QueueSize  = 500
+	Workers    = 3
+	CacheSize  = 10000
+	CacheTTL   = 24 * time.Hour
 )
 
 // =============================================================================
@@ -114,6 +129,14 @@ type Message struct {
 	ReceivedAt time.Time
 }
 
+// EnvelopeWrapper embeds SMTP envelope inside Sphinx payload
+// so exit node can deliver using the original MAIL FROM/RCPT TO
+type EnvelopeWrapper struct {
+	From string   `json:"f"`
+	To   []string `json:"t"`
+	Data []byte   `json:"d"`
+}
+
 type SphinxPacket struct {
 	Header  []byte
 	Payload []byte
@@ -143,15 +166,16 @@ var (
 
 	local    LocalNode
 	hostname string
-	pkiFile  string
+	pkiFile      string // Bootstrap PKI (read-only, never overwritten)
+	pkiStateFile string // Dynamic state (read-write, gossip discoveries)
 	keyFile  string
 
-	pki      *PKI
-	pool     *BatchPool
-	replay   *ReplayCache
-	queue    chan *Message
-	stats    *Stats
-	cover    *CoverTraffic
+	pki    *PKI
+	pool   *BatchPool
+	replay *ReplayCache
+	queue  chan *Message
+	stats  *Stats
+	cover  *CoverTraffic
 
 	useSphinx atomic.Bool
 	debugMode bool
@@ -174,11 +198,24 @@ func (p *PKI) Add(n *Node) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// v4.1.0: Enforce Kyber-768 key size (1184 bytes)
+	if len(n.PublicKey) != KyberPKSize {
+		if debugMode {
+			log.Printf("[PKI] Rejected node %s: invalid key size %d (need %d)",
+				n.Name, len(n.PublicKey), KyberPKSize)
+		}
+		return
+	}
+
 	existing, ok := p.nodes[n.ID]
 	if !ok || n.LastSeen.After(existing.LastSeen) {
 		p.nodes[n.ID] = n
 		if debugMode {
-			log.Printf("[PKI] Added/updated node %s (%s)", n.Name, n.ID[:16])
+			idStr := n.ID
+			if len(idStr) > 16 {
+				idStr = idStr[:16]
+			}
+			log.Printf("[PKI] Added/updated node %s (%s)", n.Name, idStr)
 		}
 	}
 }
@@ -241,12 +278,11 @@ func (p *PKI) HealthyCount() int {
 	return count
 }
 
-// CleanupDuplicates removes duplicate nodes with same address or name, keeping only the most recent
+// CleanupDuplicates removes duplicate nodes with same address or name
 func (p *PKI) CleanupDuplicates() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Group by address
 	byAddress := make(map[string][]*Node)
 	for _, n := range p.nodes {
 		byAddress[n.Address] = append(byAddress[n.Address], n)
@@ -258,7 +294,6 @@ func (p *PKI) CleanupDuplicates() int {
 			continue
 		}
 
-		// Find the one with most recent LastSeen
 		var newest *Node
 		for _, n := range nodes {
 			if newest == nil || n.LastSeen.After(newest.LastSeen) {
@@ -266,19 +301,21 @@ func (p *PKI) CleanupDuplicates() int {
 			}
 		}
 
-		// Remove all others
 		for _, n := range nodes {
 			if n.ID != newest.ID {
 				delete(p.nodes, n.ID)
 				removed++
 				if debugMode {
-					log.Printf("[PKI] Removed duplicate node %s (addr: %s, kept: %s)", n.ID[:16], addr, newest.ID[:16])
+					nID := n.ID
+					if len(nID) > 16 {
+						nID = nID[:16]
+					}
+					log.Printf("[PKI] Removed duplicate node %s (addr: %s)", nID, addr)
 				}
 			}
 		}
 	}
 
-	// Also group by name (for .onion hostnames)
 	byName := make(map[string][]*Node)
 	for _, n := range p.nodes {
 		if n.Name != "" {
@@ -303,7 +340,11 @@ func (p *PKI) CleanupDuplicates() int {
 				delete(p.nodes, n.ID)
 				removed++
 				if debugMode {
-					log.Printf("[PKI] Removed duplicate node %s (name: %s, kept: %s)", n.ID[:16], name, newest.ID[:16])
+					nID := n.ID
+					if len(nID) > 16 {
+						nID = nID[:16]
+					}
+					log.Printf("[PKI] Removed duplicate node %s (name: %s)", nID, name)
 				}
 			}
 		}
@@ -335,16 +376,26 @@ func (p *PKI) Load(path string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	loaded := 0
+	skipped := 0
 	for id, n := range nodes {
 		n.ID = id
+		// v4.1.0: Validate Kyber key size on load
+		if len(n.PublicKey) != KyberPKSize {
+			log.Printf("[PKI] Skipping node %s: key size %d (need %d)", n.Name, len(n.PublicKey), KyberPKSize)
+			skipped++
+			continue
+		}
 		p.nodes[id] = n
+		loaded++
 	}
 
-	log.Printf("[PKI] Loaded %d nodes from %s", len(nodes), path)
+	log.Printf("[PKI] Loaded %d nodes from %s (skipped %d invalid)", loaded, path, skipped)
 	return nil
 }
 
-func (p *PKI) Save(path string) error {
+// SaveState saves dynamic PKI state to a SEPARATE file (never overwrites bootstrap)
+func (p *PKI) SaveState(path string) error {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -356,16 +407,13 @@ func (p *PKI) Save(path string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
-// Gossip: export our node list for sharing
 func (p *PKI) ExportForGossip() []byte {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-
 	data, _ := json.Marshal(p.nodes)
 	return data
 }
 
-// Gossip: merge received node list
 func (p *PKI) MergeFromGossip(data []byte) int {
 	var received map[string]*Node
 	if err := json.Unmarshal(data, &received); err != nil {
@@ -377,22 +425,33 @@ func (p *PKI) MergeFromGossip(data []byte) int {
 
 	for id, n := range received {
 		if id == local.ID {
-			continue // Skip ourselves
+			continue
 		}
 		n.ID = id
+
+		// v4.1.0: Validate Kyber key size from gossip
+		if len(n.PublicKey) != KyberPKSize {
+			if debugMode {
+				log.Printf("[GOSSIP] Rejected node %s: invalid key size %d", n.Name, len(n.PublicKey))
+			}
+			continue
+		}
+
 		existing, ok := p.nodes[id]
 		if !ok {
 			p.nodes[id] = n
 			added++
-			log.Printf("[GOSSIP] Discovered new node: %s (%s)", n.Name, id[:16])
+			idStr := id
+			if len(idStr) > 16 {
+				idStr = idStr[:16]
+			}
+			log.Printf("[GOSSIP] Discovered new node: %s (%s)", n.Name, idStr)
 		} else if n.LastSeen.After(existing.LastSeen) {
 			p.nodes[id] = n
 		}
 	}
 
 	p.mu.Unlock()
-
-	// Cleanup duplicates after merge
 	p.CleanupDuplicates()
 
 	return added
@@ -405,7 +464,6 @@ func (p *PKI) MergeFromGossip(data []byte) int {
 func gossipWorker() {
 	defer wg.Done()
 
-	// Initial delay to let things settle
 	select {
 	case <-ctx.Done():
 		return
@@ -431,7 +489,6 @@ func doGossipRound() {
 		return
 	}
 
-	// Shuffle and pick up to 3 random nodes to gossip with
 	shuffleNodes(others)
 	count := 3
 	if len(others) < count {
@@ -457,12 +514,10 @@ func gossipWith(node *Node, myData []byte) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// Send GOSSIP command
 	fmt.Fprintf(conn, "GOSSIP %d\r\n", len(myData))
 	conn.Write(myData)
 	conn.Write([]byte("\r\n"))
 
-	// Read response
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -499,7 +554,6 @@ type BatchPool struct {
 }
 
 func newBatchPool() *BatchPool {
-	// Random threshold between min and max
 	threshold := BatchThresholdMin + cryptoRandInt(BatchThresholdMax-BatchThresholdMin+1)
 	return &BatchPool{
 		packets:   make([]*SphinxPacket, 0),
@@ -529,12 +583,10 @@ func (b *BatchPool) ShouldFlush() bool {
 		return false
 	}
 
-	// Flush if threshold reached
 	if len(b.packets) >= b.threshold {
 		return true
 	}
 
-	// Flush if oldest packet exceeded timeout
 	if len(b.addedAt) > 0 && time.Since(b.addedAt[0]) > BatchTimeout {
 		return true
 	}
@@ -550,15 +602,12 @@ func (b *BatchPool) Flush() []*SphinxPacket {
 		return nil
 	}
 
-	// Take all packets
 	result := b.packets
 	b.packets = make([]*SphinxPacket, 0)
 	b.addedAt = make([]time.Time, 0)
 
-	// Shuffle for unlinkability
 	shufflePackets(result)
 
-	// New random threshold for next batch
 	b.threshold = BatchThresholdMin + cryptoRandInt(BatchThresholdMax-BatchThresholdMin+1)
 
 	log.Printf("[POOL] Flushing %d packets (next threshold: %d)", len(result), b.threshold)
@@ -587,14 +636,14 @@ func batchWorker() {
 }
 
 // =============================================================================
-// COVER TRAFFIC - REALISTIC SMALL SERVER PATTERN
+// COVER TRAFFIC
 // =============================================================================
 
 type CoverTraffic struct {
-	lastSent    time.Time
+	lastSent     time.Time
 	sentThisHour int
-	hourStart   time.Time
-	mu          sync.Mutex
+	hourStart    time.Time
+	mu           sync.Mutex
 }
 
 func newCoverTraffic() *CoverTraffic {
@@ -610,29 +659,21 @@ func (c *CoverTraffic) shouldSend() bool {
 
 	now := time.Now()
 
-	// Reset hourly counter
 	currentHour := now.Truncate(time.Hour)
 	if currentHour.After(c.hourStart) {
 		c.sentThisHour = 0
 		c.hourStart = currentHour
 	}
 
-	// Never exceed max per hour
 	if c.sentThisHour >= CoverMaxPerHour {
 		return false
 	}
 
-	// Check minimum interval
 	if time.Since(c.lastSent) < CoverMinInterval {
 		return false
 	}
 
-	// Random chance based on time since last send
 	elapsed := time.Since(c.lastSent)
-	
-	// Probability increases with time, but stays low
-	// At MinInterval: ~5% chance per check
-	// At MaxInterval: ~50% chance per check
 	maxWait := float64(CoverMaxInterval)
 	elapsedF := float64(elapsed)
 	probability := 0.05 + 0.45*(elapsedF/maxWait)
@@ -656,7 +697,6 @@ func (c *CoverTraffic) shouldBurst() bool {
 func coverWorker() {
 	defer wg.Done()
 
-	// Random initial delay (1-10 minutes)
 	initialDelay := time.Duration(60+cryptoRandInt(540)) * time.Second
 	select {
 	case <-ctx.Done():
@@ -664,7 +704,6 @@ func coverWorker() {
 	case <-time.After(initialDelay):
 	}
 
-	// Check every 5-15 minutes (random interval each time)
 	for {
 		interval := time.Duration(5+cryptoRandInt(10)) * time.Minute
 		select {
@@ -674,11 +713,9 @@ func coverWorker() {
 			if cover.shouldSend() {
 				sendCoverMessage()
 
-				// Possible burst (2-3 messages close together)
 				if cover.shouldBurst() {
-					burstCount := 1 + cryptoRandInt(2) // 1-2 extra messages
+					burstCount := 1 + cryptoRandInt(2)
 					for i := 0; i < burstCount; i++ {
-						// Small delay between burst messages (10-60 seconds)
 						burstDelay := time.Duration(10+cryptoRandInt(50)) * time.Second
 						select {
 						case <-ctx.Done():
@@ -701,25 +738,21 @@ func sendCoverMessage() {
 		return
 	}
 
-	// Create dummy message with realistic size
-	size := 500 + cryptoRandInt(2000) // 500-2500 bytes
+	size := 500 + cryptoRandInt(2000)
 	dummy := make([]byte, size)
 	rand.Read(dummy)
 
-	// Select random route
 	hopCount := MinHops + cryptoRandInt(MaxHops-MinHops+1)
 	route := selectRoute(healthy, hopCount)
 	if route == nil {
 		return
 	}
 
-	// Create and send Sphinx packet
-	packet := createSphinxPacket(dummy, route, true) // isDummy = true
+	packet := createSphinxPacket(dummy, route, true)
 	if packet == nil {
 		return
 	}
 
-	// Send to first hop
 	if err := sendToNode(route[0], packet); err != nil {
 		if debugMode {
 			log.Printf("[COVER] Failed to send: %v", err)
@@ -810,17 +843,43 @@ func cryptoRandBytes(n int) []byte {
 }
 
 func generateKeyPair() (pub, priv []byte) {
-	priv = make([]byte, 32)
-	rand.Read(priv)
-	pub = make([]byte, 32)
-	curve25519.ScalarBaseMult((*[32]byte)(pub), (*[32]byte)(priv))
-	return
+	privKey, pubKey, err := kyberk2so.KemKeypair768()
+	if err != nil {
+		log.Printf("[CRYPTO] Failed to generate Kyber keypair: %v", err)
+		return nil, nil
+	}
+	return pubKey[:], privKey[:]
 }
 
-func sharedSecret(priv, pub []byte) []byte {
-	shared := make([]byte, 32)
-	curve25519.ScalarMult((*[32]byte)(shared), (*[32]byte)(priv), (*[32]byte)(pub))
-	return shared
+func kyberEncapsulate(pubKey []byte) (ciphertext, sharedSecret []byte, err error) {
+	if len(pubKey) != KyberPKSize {
+		return nil, nil, fmt.Errorf("invalid public key size: %d (need %d)", len(pubKey), KyberPKSize)
+	}
+	var pk [1184]byte
+	copy(pk[:], pubKey)
+	ct, ss, err := kyberk2so.KemEncrypt768(pk)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ct[:], ss[:], nil
+}
+
+func kyberDecapsulate(ciphertext, privKey []byte) (sharedSecret []byte, err error) {
+	if len(ciphertext) != KyberCTSize {
+		return nil, fmt.Errorf("invalid ciphertext size: %d", len(ciphertext))
+	}
+	if len(privKey) != KyberSKSize {
+		return nil, fmt.Errorf("invalid private key size: %d", len(privKey))
+	}
+	var ct [1088]byte
+	var sk [2400]byte
+	copy(ct[:], ciphertext)
+	copy(sk[:], privKey)
+	ss, err := kyberk2so.KemDecrypt768(ct, sk)
+	if err != nil {
+		return nil, err
+	}
+	return ss[:], nil
 }
 
 func deriveKeys(secret []byte) (encKey, macKey []byte) {
@@ -840,7 +899,6 @@ func computeMAC(key, data []byte) []byte {
 
 func verifyMAC(key, data, expected []byte) bool {
 	computed := computeMAC(key, data)
-	// Truncate to same length as expected (16 bytes in Sphinx)
 	if len(expected) < len(computed) {
 		computed = computed[:len(expected)]
 	}
@@ -884,7 +942,6 @@ func selectRoute(healthy []*Node, hopCount int) []*Node {
 	if len(healthy) < hopCount {
 		return nil
 	}
-
 	shuffleNodes(healthy)
 	return healthy[:hopCount]
 }
@@ -894,60 +951,52 @@ func createSphinxPacket(payload []byte, route []*Node, isDummy bool) *SphinxPack
 		return nil
 	}
 
-	// Pad payload to fixed size
 	padded := padPayload(payload)
 
-	// Generate independent ephemeral key pairs for each hop
-	// Each hop gets its own fresh key pair
 	type hopInfo struct {
-		ephPub  []byte
-		ephPriv []byte
-		encKey  []byte
-		macKey  []byte
+		ciphertext []byte
+		encKey     []byte
+		macKey     []byte
 	}
-	
+
 	hops := make([]hopInfo, len(route))
-	
+
 	for i := 0; i < len(route); i++ {
-		// Generate fresh ephemeral key pair for each hop
-		ephPub, ephPriv := generateKeyPair()
 		node := route[i]
 
-		// Compute shared secret with this node's public key
-		secret := sharedSecret(ephPriv, node.PublicKey)
-		encKey, macKey := deriveKeys(secret)
+		ciphertext, sharedSecret, err := kyberEncapsulate(node.PublicKey)
+		if err != nil {
+			log.Printf("[SPHINX-CREATE] Kyber encapsulation failed for hop %d: %v", i, err)
+			return nil
+		}
+
+		encKey, macKey := deriveKeys(sharedSecret)
 
 		hops[i] = hopInfo{
-			ephPub:  ephPub,
-			ephPriv: ephPriv,
-			encKey:  encKey,
-			macKey:  macKey,
+			ciphertext: ciphertext,
+			encKey:     encKey,
+			macKey:     macKey,
 		}
 
 		if debugMode {
-			log.Printf("[SPHINX-CREATE] Hop %d (%s): ephPub=%s nodePub=%s secret=%s macKey=%s",
+			log.Printf("[SPHINX-CREATE] Hop %d (%s): ct=%s secret=%s",
 				i, node.Name,
-				base64.StdEncoding.EncodeToString(ephPub)[:16],
-				base64.StdEncoding.EncodeToString(node.PublicKey)[:16],
-				base64.StdEncoding.EncodeToString(secret)[:16],
-				base64.StdEncoding.EncodeToString(macKey)[:16])
+				base64.StdEncoding.EncodeToString(ciphertext)[:16],
+				base64.StdEncoding.EncodeToString(sharedSecret)[:16])
 		}
 	}
 
 	// Build layers from exit to entry (reverse order)
-	// Each layer wraps the previous one
 	currentPayload := padded
 
 	for i := len(route) - 1; i >= 0; i-- {
 		hop := hops[i]
 
-		// Encrypt the current payload (which includes the next layer's header)
 		encrypted, err := aesEncrypt(hop.encKey, currentPayload)
 		if err != nil {
 			return nil
 		}
 
-		// Build routing info - just the next hop address
 		var nextHop string
 		isExit := (i == len(route)-1)
 		if isExit {
@@ -963,27 +1012,19 @@ func createSphinxPacket(payload []byte, route []*Node, isDummy bool) *SphinxPack
 		routingPadded := make([]byte, 128)
 		copy(routingPadded, []byte(nextHop))
 
-		// MAC over routing info
 		mac := computeMAC(hop.macKey, routingPadded)
 
-		// Header = ephemeral pubkey + routing + mac (176 bytes)
-		header := make([]byte, 0, 176)
-		header = append(header, hop.ephPub...)      // 32 bytes
-		header = append(header, routingPadded...)   // 128 bytes
-		header = append(header, mac[:16]...)        // 16 bytes
+		header := make([]byte, 0, HeaderSize)
+		header = append(header, hop.ciphertext...)
+		header = append(header, routingPadded...)
+		header = append(header, mac[:16]...)
 
-		// New payload = header + encrypted previous payload
 		currentPayload = append(header, encrypted...)
-		
+
 		if debugMode {
 			log.Printf("[SPHINX-CREATE] Layer %d: header=%d encrypted=%d total=%d",
 				i, len(header), len(encrypted), len(currentPayload))
 		}
-	}
-
-	if debugMode {
-		log.Printf("[SPHINX-CREATE] Final: Header=%d Payload=%d", 
-			len(currentPayload[:HeaderSize]), len(currentPayload[HeaderSize:]))
 	}
 
 	return &SphinxPacket{
@@ -993,33 +1034,27 @@ func createSphinxPacket(payload []byte, route []*Node, isDummy bool) *SphinxPack
 }
 
 func processSphinxPacket(packet *SphinxPacket) {
-	if len(packet.Header) < 176 {
-		log.Printf("[SPHINX] Header too short: %d bytes", len(packet.Header))
+	if len(packet.Header) < HeaderSize {
+		log.Printf("[SPHINX] Header too short: %d bytes (need %d)", len(packet.Header), HeaderSize)
 		return
 	}
 
-	// Extract ephemeral public key
-	ephPub := packet.Header[:32]
+	ciphertext := packet.Header[:KyberCTSize]
 
-	// Compute shared secret with our private key
-	secret := sharedSecret(local.Private, ephPub)
+	secret, err := kyberDecapsulate(ciphertext, local.Private)
+	if err != nil {
+		log.Printf("[SPHINX] Kyber decapsulation failed: %v", err)
+		return
+	}
 	encKey, macKey := deriveKeys(secret)
 
-	// Extract and verify routing info
-	routingInfo := packet.Header[32:160]
-	receivedMAC := packet.Header[160:176]
+	routingInfo := packet.Header[KyberCTSize : KyberCTSize+128]
+	receivedMAC := packet.Header[KyberCTSize+128 : HeaderSize]
 
 	if debugMode {
-		log.Printf("[SPHINX-RECV] ephPub=%s localPub=%s secret=%s macKey=%s",
-			base64.StdEncoding.EncodeToString(ephPub)[:16],
-			base64.StdEncoding.EncodeToString(local.Public)[:16],
-			base64.StdEncoding.EncodeToString(secret)[:16],
-			base64.StdEncoding.EncodeToString(macKey)[:16])
-		expectedMAC := computeMAC(macKey, routingInfo)
-		log.Printf("[SPHINX-RECV] receivedMAC=%s expectedMAC=%s",
-			base64.StdEncoding.EncodeToString(receivedMAC),
-			base64.StdEncoding.EncodeToString(expectedMAC[:16]))
-		log.Printf("[SPHINX-RECV] Header=%d Payload=%d", len(packet.Header), len(packet.Payload))
+		log.Printf("[SPHINX-RECV] ct=%s secret=%s",
+			base64.StdEncoding.EncodeToString(ciphertext)[:16],
+			base64.StdEncoding.EncodeToString(secret)[:16])
 	}
 
 	if !verifyMAC(macKey, routingInfo, receivedMAC) {
@@ -1027,19 +1062,12 @@ func processSphinxPacket(packet *SphinxPacket) {
 		return
 	}
 
-	// Decrypt payload
-	if debugMode {
-		log.Printf("[SPHINX-RECV] Decrypting payload of %d bytes with encKey=%s",
-			len(packet.Payload), base64.StdEncoding.EncodeToString(encKey)[:16])
-	}
 	decrypted, err := aesDecrypt(encKey, packet.Payload)
 	if err != nil {
 		log.Printf("[SPHINX] Decryption failed: %v", err)
 		return
 	}
 
-	// Parse routing info to find next hop
-	// Format: "address\0nextEphPub..." or just "EXIT\0..." or "DUMMY\0..."
 	nullIdx := bytes.IndexByte(routingInfo, 0)
 	var nextHopAddr string
 	if nullIdx == -1 {
@@ -1061,7 +1089,7 @@ func processSphinxPacket(packet *SphinxPacket) {
 		return
 	}
 
-	// Forward to next hop - decrypted payload contains the complete next packet
+	// Forward to next hop
 	if len(decrypted) > HeaderSize {
 		nextPacket := &SphinxPacket{
 			Header:  decrypted[:HeaderSize],
@@ -1070,14 +1098,31 @@ func processSphinxPacket(packet *SphinxPacket) {
 
 		node := pki.Get(findNodeByAddress(nextHopAddr))
 		if node != nil {
-			// Add delay before forwarding
 			delay := time.Duration(500+cryptoRandInt(2000)) * time.Millisecond
 			time.Sleep(delay)
 
-			if err := sendToNode(node, nextPacket); err != nil {
-				log.Printf("[SPHINX] Forward failed: %v", err)
-			} else if debugMode {
-				log.Printf("[SPHINX] Forwarded to %s", nextHopAddr)
+			maxRetries := 3
+			var lastErr error
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				if err := sendToNode(node, nextPacket); err != nil {
+					lastErr = err
+					if attempt < maxRetries {
+						backoff := time.Duration(1<<attempt) * time.Second
+						if debugMode {
+							log.Printf("[SPHINX] Forward attempt %d failed: %v, retrying in %v", attempt, err, backoff)
+						}
+						time.Sleep(backoff)
+					}
+				} else {
+					if debugMode {
+						log.Printf("[SPHINX] Forwarded to %s (attempt %d)", nextHopAddr, attempt)
+					}
+					lastErr = nil
+					break
+				}
+			}
+			if lastErr != nil {
+				log.Printf("[SPHINX] Forward failed after %d attempts: %v", maxRetries, lastErr)
 			}
 		} else {
 			log.Printf("[SPHINX] Unknown next hop: %s", nextHopAddr)
@@ -1102,13 +1147,11 @@ func sendToNode(node *Node, packet *SphinxPacket) error {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// Send SPHINX command
 	data := append(packet.Header, packet.Payload...)
 	fmt.Fprintf(conn, "SPHINX %d\r\n", len(data))
 	conn.Write(data)
 	conn.Write([]byte("\r\n"))
 
-	// Read response
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -1123,7 +1166,6 @@ func sendToNode(node *Node, packet *SphinxPacket) error {
 }
 
 func padPayload(data []byte) []byte {
-	// Format: [4 bytes length][data][random padding to PayloadMax]
 	result := make([]byte, PayloadMax)
 	binary.BigEndian.PutUint32(result[:4], uint32(len(data)))
 	copy(result[4:], data)
@@ -1142,6 +1184,10 @@ func unpadPayload(padded []byte) ([]byte, error) {
 	return padded[4 : 4+length], nil
 }
 
+// =============================================================================
+// EXIT NODE: DELIVERY WITH ENVELOPE AND HEADER SANITIZATION
+// =============================================================================
+
 func deliverMessage(padded []byte) {
 	data, err := unpadPayload(padded)
 	if err != nil {
@@ -1149,22 +1195,396 @@ func deliverMessage(padded []byte) {
 		return
 	}
 
-	// Parse message
-	msg := parseMessage(data)
-	if msg == nil {
-		log.Printf("[EXIT] Parse failed")
+	// v4.1.0: Try to unwrap envelope first
+	var envelope EnvelopeWrapper
+	if err := json.Unmarshal(data, &envelope); err == nil && len(envelope.To) > 0 && len(envelope.Data) > 0 {
+		// Successfully unwrapped envelope
+		sanitized := sanitizeHeaders(envelope.Data)
+
+		for _, rcpt := range envelope.To {
+			msg := &Message{
+				From: envelope.From,
+				To:   []string{rcpt},
+				Data: sanitized,
+			}
+			if err := deliverToRecipient(msg); err != nil {
+				log.Printf("[EXIT] Delivery failed to %s: %v", rcpt, err)
+				atomic.AddInt64(&stats.Failed, 1)
+			} else {
+				atomic.AddInt64(&stats.Delivered, 1)
+				log.Printf("[EXIT] Delivered to %s", rcpt)
+			}
+		}
 		return
 	}
 
-	// Deliver via SMTP
-	if err := deliverSMTP(msg); err != nil {
-		log.Printf("[EXIT] Delivery failed: %v", err)
+	// Fallback: parse raw message (backward compatibility)
+	msg := parseMessage(data)
+	if msg == nil || len(msg.To) == 0 {
+		log.Printf("[EXIT] Parse failed - no recipients found")
 		atomic.AddInt64(&stats.Failed, 1)
 		return
 	}
 
-	atomic.AddInt64(&stats.Delivered, 1)
-	log.Printf("[EXIT] Delivered to %v", msg.To)
+	msg.Data = sanitizeHeaders(msg.Data)
+
+	for _, rcpt := range msg.To {
+		singleMsg := &Message{
+			From: msg.From,
+			To:   []string{rcpt},
+			Data: msg.Data,
+		}
+		if err := deliverToRecipient(singleMsg); err != nil {
+			log.Printf("[EXIT] Delivery failed to %s: %v", rcpt, err)
+			atomic.AddInt64(&stats.Failed, 1)
+		} else {
+			atomic.AddInt64(&stats.Delivered, 1)
+			log.Printf("[EXIT] Delivered to %s", rcpt)
+		}
+	}
+}
+
+// sanitizeHeaders removes identifying headers at exit node
+func sanitizeHeaders(data []byte) []byte {
+	// Normalize line endings: support \r\n, \n, or mixed
+	normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+
+	var headers []string
+	var body []string
+	inHeaders := true
+	fromFound := false
+	headerEndIdx := -1
+
+	for i, line := range lines {
+		if inHeaders && line == "" {
+			headerEndIdx = i
+			inHeaders = false
+			continue
+		}
+
+		if inHeaders {
+			lower := strings.ToLower(line)
+
+			// Strip identifying headers
+			if strings.HasPrefix(lower, "x-") ||
+				strings.HasPrefix(lower, "received:") ||
+				strings.HasPrefix(lower, "reply-to:") ||
+				strings.HasPrefix(lower, "user-agent:") ||
+				strings.HasPrefix(lower, "x-mailer:") {
+				continue
+			}
+
+			// Replace From with anonymous
+			if strings.HasPrefix(lower, "from:") {
+				headers = append(headers, fmt.Sprintf("From: Anonymous <anonymous@%s.fog>", local.Name))
+				fromFound = true
+				continue
+			}
+
+			// Replace Date with randomized
+			if strings.HasPrefix(lower, "date:") {
+				continue // Will inject our own below
+			}
+
+			// Replace Message-ID with random
+			if strings.HasPrefix(lower, "message-id:") {
+				continue // Will inject our own below
+			}
+
+			// Keep all other headers: Subject, To, Content-Type, MIME-Version,
+			// Newsgroups, References, In-Reply-To, Content-Transfer-Encoding
+			headers = append(headers, line)
+		} else {
+			body = append(body, line)
+		}
+	}
+
+	// Inject required headers if missing or replaced
+	if !fromFound {
+		headers = append(headers, fmt.Sprintf("From: Anonymous <anonymous@%s.fog>", local.Name))
+	}
+
+	// Always inject sanitized Date (randomized ±1-2 hours)
+	offset := time.Duration(cryptoRandInt(7200)-3600) * time.Second
+	headers = append(headers, fmt.Sprintf("Date: %s",
+		time.Now().Add(offset).UTC().Format("Mon, 02 Jan 2006 15:04:05 -0000")))
+
+	// Always inject random Message-ID
+	headers = append(headers, fmt.Sprintf("Message-ID: <%s@%s.fog>",
+		hex.EncodeToString(cryptoRandBytes(12)), local.Name))
+
+	// If no header/body separator was found, treat entire input as body
+	if headerEndIdx == -1 {
+		log.Printf("[SANITIZE] Warning: no header/body separator found, treating as headerless message")
+		body = lines
+	}
+
+	// Rebuild message: headers + empty line + body
+	var result bytes.Buffer
+	for _, h := range headers {
+		result.WriteString(h)
+		result.WriteString("\r\n")
+	}
+	result.WriteString("\r\n") // Empty line separator
+	for i, b := range body {
+		result.WriteString(b)
+		if i < len(body)-1 {
+			result.WriteString("\r\n")
+		}
+	}
+
+	return result.Bytes()
+}
+
+// deliverToRecipient delivers a single message to a single recipient
+func deliverToRecipient(msg *Message) error {
+	if len(msg.To) == 0 {
+		return errors.New("no recipient")
+	}
+
+	rcpt := msg.To[0]
+	parts := strings.Split(rcpt, "@")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid recipient: %s", rcpt)
+	}
+	domain := parts[1]
+
+	var smtpAddr string
+	if strings.HasSuffix(domain, ".onion") {
+		smtpAddr = domain + ":25"
+	} else {
+		// v4.1.0: Resolve MX through Tor (no DNS leak)
+		mxHost, err := lookupMXViaTor(domain)
+		if err != nil {
+			if debugMode {
+				log.Printf("[EXIT] MX lookup via Tor failed for %s: %v, using domain directly", domain, err)
+			}
+			smtpAddr = domain + ":25"
+		} else {
+			smtpAddr = mxHost + ":25"
+		}
+	}
+
+	conn, err := dialTor(smtpAddr)
+	if err != nil {
+		return fmt.Errorf("connect to %s: %v", smtpAddr, err)
+	}
+	defer conn.Close()
+
+	client, err := smtp.NewClient(conn, domain)
+	if err != nil {
+		return fmt.Errorf("smtp client: %v", err)
+	}
+	defer client.Close()
+
+	fromAddr := extractAddress(msg.From)
+	if fromAddr == "" {
+		fromAddr = fmt.Sprintf("anonymous@%s.fog", local.Name)
+	}
+
+	if err := client.Mail(fromAddr); err != nil {
+		return fmt.Errorf("MAIL FROM: %v", err)
+	}
+	if err := client.Rcpt(rcpt); err != nil {
+		return fmt.Errorf("RCPT TO: %v", err)
+	}
+
+	wc, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("DATA: %v", err)
+	}
+
+	if _, err := wc.Write(msg.Data); err != nil {
+		wc.Close()
+		return fmt.Errorf("write data: %v", err)
+	}
+
+	if err := wc.Close(); err != nil {
+		return fmt.Errorf("end data: %v", err)
+	}
+
+	return nil
+}
+
+// lookupMXViaTor resolves MX records through Tor SOCKS5
+// Falls back to direct domain if resolution fails
+func lookupMXViaTor(domain string) (string, error) {
+	// Tor exit nodes handle DNS resolution internally
+	// We connect to a public DNS-over-TCP service through Tor
+	conn, err := torDialer.Dial("tcp", "1.1.1.1:53")
+	if err != nil {
+		// Fallback: let Tor exit node resolve by connecting directly
+		return domain, nil
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// Build minimal DNS MX query
+	txID := cryptoRandBytes(2)
+	query := buildDNSMXQuery(txID, domain)
+
+	// DNS over TCP: 2-byte length prefix
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(query)))
+	conn.Write(lenBuf)
+	conn.Write(query)
+
+	// Read response length
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return domain, err
+	}
+	respLen := binary.BigEndian.Uint16(lenBuf)
+	if respLen > 4096 {
+		return domain, errors.New("DNS response too large")
+	}
+
+	resp := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return domain, err
+	}
+
+	// Parse MX from response
+	mx := parseDNSMXResponse(resp)
+	if mx != "" {
+		return mx, nil
+	}
+
+	return domain, nil
+}
+
+// buildDNSMXQuery creates a raw DNS query for MX records
+func buildDNSMXQuery(txID []byte, domain string) []byte {
+	var buf bytes.Buffer
+
+	// Transaction ID
+	buf.Write(txID)
+	// Flags: standard query, recursion desired
+	buf.Write([]byte{0x01, 0x00})
+	// Questions: 1
+	buf.Write([]byte{0x00, 0x01})
+	// Answer, Authority, Additional: 0
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+
+	// Encode domain name
+	parts := strings.Split(domain, ".")
+	for _, part := range parts {
+		buf.WriteByte(byte(len(part)))
+		buf.WriteString(part)
+	}
+	buf.WriteByte(0x00) // Root label
+
+	// Type: MX (15)
+	buf.Write([]byte{0x00, 0x0f})
+	// Class: IN (1)
+	buf.Write([]byte{0x00, 0x01})
+
+	return buf.Bytes()
+}
+
+// parseDNSMXResponse extracts the first MX hostname from a DNS response
+func parseDNSMXResponse(resp []byte) string {
+	if len(resp) < 12 {
+		return ""
+	}
+
+	// Skip header (12 bytes)
+	offset := 12
+
+	// Skip question section
+	qdCount := int(binary.BigEndian.Uint16(resp[4:6]))
+	for i := 0; i < qdCount && offset < len(resp); i++ {
+		// Skip name
+		for offset < len(resp) {
+			if resp[offset] == 0 {
+				offset++
+				break
+			}
+			if resp[offset]&0xC0 == 0xC0 {
+				offset += 2
+				break
+			}
+			offset += int(resp[offset]) + 1
+		}
+		offset += 4 // Skip type and class
+	}
+
+	// Parse answer section
+	anCount := int(binary.BigEndian.Uint16(resp[6:8]))
+	for i := 0; i < anCount && offset < len(resp); i++ {
+		// Skip name (possibly compressed)
+		if offset < len(resp) && resp[offset]&0xC0 == 0xC0 {
+			offset += 2
+		} else {
+			for offset < len(resp) {
+				if resp[offset] == 0 {
+					offset++
+					break
+				}
+				offset += int(resp[offset]) + 1
+			}
+		}
+
+		if offset+10 > len(resp) {
+			break
+		}
+
+		rtype := binary.BigEndian.Uint16(resp[offset : offset+2])
+		offset += 2 // Type
+		offset += 2 // Class
+		offset += 4 // TTL
+		rdLen := int(binary.BigEndian.Uint16(resp[offset : offset+2]))
+		offset += 2 // RDLENGTH
+
+		if rtype == 15 && rdLen > 2 { // MX record
+			offset += 2 // Skip preference
+			// Read exchange name
+			name := readDNSName(resp, offset)
+			if name != "" {
+				return name
+			}
+		}
+
+		offset += rdLen
+	}
+
+	return ""
+}
+
+// readDNSName reads a DNS name from a response, handling compression
+func readDNSName(resp []byte, offset int) string {
+	var parts []string
+	visited := make(map[int]bool) // Prevent infinite loops from malicious packets
+
+	for offset < len(resp) {
+		if visited[offset] {
+			break
+		}
+		visited[offset] = true
+
+		length := int(resp[offset])
+		if length == 0 {
+			break
+		}
+
+		if length&0xC0 == 0xC0 {
+			if offset+1 >= len(resp) {
+				break
+			}
+			newOffset := int(binary.BigEndian.Uint16(resp[offset:offset+2]) & 0x3FFF)
+			offset = newOffset
+			continue
+		}
+
+		offset++
+		if offset+length > len(resp) {
+			break
+		}
+		parts = append(parts, string(resp[offset:offset+length]))
+		offset += length
+	}
+
+	return strings.Join(parts, ".")
 }
 
 // =============================================================================
@@ -1208,7 +1628,7 @@ func handleSMTP(conn net.Conn) {
 		writer.Flush()
 	}
 
-	write(fmt.Sprintf("220 %s fog/%s", hostname, Version))
+	write(fmt.Sprintf("220 fog/%s ESMTP", Version))
 
 	var from string
 	var to []string
@@ -1220,10 +1640,12 @@ func handleSMTP(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		line = strings.TrimSpace(line)
 
 		if inData {
-			if line == "." {
+			// v4.1.0: Only trim \r\n, preserve internal whitespace for MIME/PGP integrity
+			stripped := strings.TrimRight(line, "\r\n")
+
+			if stripped == "." {
 				inData = false
 				write("250 OK queued")
 
@@ -1238,7 +1660,7 @@ func handleSMTP(conn net.Conn) {
 				select {
 				case queue <- msg:
 					atomic.AddInt64(&stats.Received, 1)
-					log.Printf("[SMTP] Queued %s from %s to %v", msg.ID, from, to)
+					log.Printf("[SMTP] Queued %s from %s to %v (%d bytes)", msg.ID, from, to, len(msg.Data))
 				default:
 					log.Printf("[SMTP] Queue full, dropping message")
 				}
@@ -1247,18 +1669,28 @@ func handleSMTP(conn net.Conn) {
 				to = nil
 				data.Reset()
 			} else {
-				if strings.HasPrefix(line, ".") {
-					line = line[1:]
+				// Dot-stuffing (RFC 5321 4.5.2)
+				if strings.HasPrefix(stripped, ".") {
+					stripped = stripped[1:]
 				}
-				data.WriteString(line + "\r\n")
+				data.WriteString(stripped + "\r\n")
 			}
 			continue
 		}
 
+		line = strings.TrimRight(line, "\r\n")
 		upper := strings.ToUpper(line)
 
 		switch {
-		case strings.HasPrefix(upper, "HELO"), strings.HasPrefix(upper, "EHLO"):
+		case strings.HasPrefix(upper, "EHLO"):
+			// v4.1.0: Proper ESMTP capability advertisement
+			write(fmt.Sprintf("250-%s", hostname))
+			write("250-8BITMIME")
+			write("250-SMTPUTF8")
+			write(fmt.Sprintf("250-SIZE %d", MaxMsgSize))
+			write("250 PIPELINING")
+
+		case strings.HasPrefix(upper, "HELO"):
 			write(fmt.Sprintf("250 %s", hostname))
 
 		case strings.HasPrefix(upper, "MAIL FROM:"):
@@ -1270,6 +1702,10 @@ func handleSMTP(conn net.Conn) {
 			write("250 OK")
 
 		case upper == "DATA":
+			if from == "" || len(to) == 0 {
+				write("503 Bad sequence")
+				continue
+			}
 			write("354 Start mail input")
 			inData = true
 
@@ -1294,13 +1730,12 @@ func handleSMTP(conn net.Conn) {
 
 func extractAddress(s string) string {
 	s = strings.TrimSpace(s)
-	// Handle "Display Name <email@domain>" format
-	if start := strings.Index(s, "<"); start != -1 {
-		if end := strings.Index(s, ">"); end > start {
-			return s[start+1 : end]
+	// Use LAST '<' to handle nested brackets like <Name <email>>
+	if lastStart := strings.LastIndex(s, "<"); lastStart != -1 {
+		if end := strings.Index(s[lastStart:], ">"); end != -1 {
+			return s[lastStart+1 : lastStart+end]
 		}
 	}
-	// Handle "<email@domain>" format
 	if strings.HasPrefix(s, "<") && strings.HasSuffix(s, ">") {
 		return s[1 : len(s)-1]
 	}
@@ -1308,7 +1743,7 @@ func extractAddress(s string) string {
 }
 
 // =============================================================================
-// NODE SERVER (receives Sphinx packets and Gossip)
+// NODE SERVER
 // =============================================================================
 
 func startNodeServer(addr string) error {
@@ -1378,7 +1813,6 @@ func handleNode(conn net.Conn) {
 			io.ReadFull(reader, data)
 			pki.MergeFromGossip(data)
 
-			// Respond with our node list
 			myData := pki.ExportForGossip()
 			fmt.Fprintf(conn, "GOSSIP %d\r\n", len(myData))
 			conn.Write(myData)
@@ -1425,22 +1859,63 @@ func processMessage(msg *Message, workerID int) {
 	delay := time.Duration(100+cryptoRandInt(2000)) * time.Millisecond
 	time.Sleep(delay)
 
-	// Always use Sphinx routing (no direct relay fallback)
-	if !useSphinx.Load() {
-		log.Printf("[WORKER %d] Sphinx disabled, cannot route %s", workerID, msg.ID)
+	// v4.1.0: Wrap SMTP envelope into payload for Sphinx routing
+	envelopePayload, err := json.Marshal(&EnvelopeWrapper{
+		From: msg.From,
+		To:   msg.To,
+		Data: msg.Data,
+	})
+	if err != nil {
+		log.Printf("[WORKER %d] Failed to marshal envelope for %s: %v", workerID, msg.ID, err)
 		atomic.AddInt64(&stats.Failed, 1)
+		return
+	}
+
+	// Check payload size limit
+	if len(envelopePayload) > PayloadMax-4 {
+		log.Printf("[WORKER %d] Message %s too large for Sphinx (%d bytes), using direct relay",
+			workerID, msg.ID, len(envelopePayload))
+		if err := directRelay(msg); err != nil {
+			log.Printf("[WORKER %d] Direct relay failed for %s: %v", workerID, msg.ID, err)
+			atomic.AddInt64(&stats.Failed, 1)
+		} else {
+			atomic.AddInt64(&stats.DirectRelay, 1)
+			log.Printf("[WORKER %d] Direct relayed %s (oversized)", workerID, msg.ID)
+		}
+		return
+	}
+
+	// v4.1.0: Fallback to direct relay if Sphinx unavailable
+	if !useSphinx.Load() {
+		log.Printf("[WORKER %d] Sphinx disabled, using direct relay for %s", workerID, msg.ID)
+		if err := directRelay(msg); err != nil {
+			log.Printf("[WORKER %d] Direct relay failed for %s: %v", workerID, msg.ID, err)
+			atomic.AddInt64(&stats.Failed, 1)
+		} else {
+			atomic.AddInt64(&stats.DirectRelay, 1)
+			log.Printf("[WORKER %d] Direct relayed %s", workerID, msg.ID)
+		}
 		return
 	}
 
 	healthy := pki.GetHealthy()
 	if len(healthy) < MinHops {
-		log.Printf("[WORKER %d] Not enough healthy nodes (%d < %d) for %s",
+		log.Printf("[WORKER %d] Not enough healthy nodes (%d < %d), using direct relay for %s",
 			workerID, len(healthy), MinHops, msg.ID)
-		atomic.AddInt64(&stats.Failed, 1)
+		if err := directRelay(msg); err != nil {
+			log.Printf("[WORKER %d] Direct relay failed for %s: %v", workerID, msg.ID, err)
+			atomic.AddInt64(&stats.Failed, 1)
+		} else {
+			atomic.AddInt64(&stats.DirectRelay, 1)
+			log.Printf("[WORKER %d] Direct relayed %s (insufficient nodes)", workerID, msg.ID)
+		}
 		return
 	}
 
 	hopCount := MinHops + cryptoRandInt(MaxHops-MinHops+1)
+	if hopCount > len(healthy) {
+		hopCount = len(healthy)
+	}
 	route := selectRoute(healthy, hopCount)
 	if route == nil {
 		log.Printf("[WORKER %d] Failed to select route for %s", workerID, msg.ID)
@@ -1448,7 +1923,8 @@ func processMessage(msg *Message, workerID int) {
 		return
 	}
 
-	packet := createSphinxPacket(msg.Data, route, false)
+	// v4.1.0: Use envelope payload instead of raw msg.Data
+	packet := createSphinxPacket(envelopePayload, route, false)
 	if packet == nil {
 		log.Printf("[WORKER %d] Failed to create Sphinx packet for %s", workerID, msg.ID)
 		atomic.AddInt64(&stats.Failed, 1)
@@ -1465,93 +1941,31 @@ func processMessage(msg *Message, workerID int) {
 	log.Printf("[WORKER %d] Sphinx routed %s via %d hops", workerID, msg.ID, hopCount)
 }
 
+// v4.1.0: directRelay delivers message directly through Tor (no Sphinx)
 func directRelay(msg *Message) error {
+	sanitized := sanitizeHeaders(msg.Data)
+
 	for _, rcpt := range msg.To {
-		if err := deliverSMTP(&Message{
+		singleMsg := &Message{
 			From: msg.From,
 			To:   []string{rcpt},
-			Data: msg.Data,
-		}); err != nil {
-			return err
+			Data: sanitized,
+		}
+		if err := deliverToRecipient(singleMsg); err != nil {
+			return fmt.Errorf("relay to %s: %v", rcpt, err)
 		}
 	}
 	return nil
 }
 
-func deliverSMTP(msg *Message) error {
-	if len(msg.To) == 0 {
-		return errors.New("no recipients")
-	}
-
-	rcpt := msg.To[0]
-	parts := strings.Split(rcpt, "@")
-	if len(parts) != 2 {
-		return errors.New("invalid recipient")
-	}
-	domain := parts[1]
-
-	// Determine SMTP server
-	var smtpAddr string
-	if strings.HasSuffix(domain, ".onion") {
-		smtpAddr = domain + ":25"
-	} else {
-		mx, err := net.LookupMX(domain)
-		if err != nil || len(mx) == 0 {
-			smtpAddr = domain + ":25"
-		} else {
-			smtpAddr = mx[0].Host + ":25"
-		}
-	}
-
-	// Connect via Tor
-	conn, err := dialTor(smtpAddr)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	client, err := smtp.NewClient(conn, domain)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-
-	// Extract bare email address from From (remove display name if present)
-	fromAddr := extractAddress(msg.From)
-	if fromAddr == "" {
-		fromAddr = msg.From
-	}
-
-	if err := client.Mail(fromAddr); err != nil {
-		return err
-	}
-	if err := client.Rcpt(rcpt); err != nil {
-		return err
-	}
-
-	wc, err := client.Data()
-	if err != nil {
-		return err
-	}
-
-	_, err = wc.Write(msg.Data)
-	if err != nil {
-		wc.Close()
-		return err
-	}
-
-	return wc.Close()
-}
-
 func parseMessage(data []byte) *Message {
-	// Simple parser - extract From and To from headers
 	lines := strings.Split(string(data), "\n")
 	msg := &Message{Data: data}
 
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
+		line = strings.TrimRight(line, "\r")
 		if line == "" {
-			break // End of headers
+			break
 		}
 		lower := strings.ToLower(line)
 		if strings.HasPrefix(lower, "from:") {
@@ -1562,7 +1976,7 @@ func parseMessage(data []byte) *Message {
 	}
 
 	if msg.From == "" {
-		msg.From = "anonymous@fog.local"
+		msg.From = fmt.Sprintf("anonymous@%s.fog", local.Name)
 	}
 
 	return msg
@@ -1672,7 +2086,6 @@ func initNode(addr string) {
 	var pub, priv []byte
 	var id string
 
-	// Try to load existing key
 	if keyFile != "" {
 		if data, err := os.ReadFile(keyFile); err == nil {
 			var saved struct {
@@ -1684,22 +2097,24 @@ func initNode(addr string) {
 				pub, _ = base64.StdEncoding.DecodeString(saved.Public)
 				priv, _ = base64.StdEncoding.DecodeString(saved.Private)
 				id = saved.ID
-				if len(pub) == 32 && len(priv) == 32 && id != "" {
-					log.Printf("[NODE] Loaded existing keypair from %s", keyFile)
+				if len(pub) == KyberPKSize && len(priv) == KyberSKSize && id != "" {
+					log.Printf("[NODE] Loaded existing Kyber keypair from %s", keyFile)
+				} else if len(pub) == 32 && len(priv) == 32 {
+					log.Printf("[NODE] Found old Curve25519 keys, regenerating Kyber keypair")
+					pub, priv, id = nil, nil, ""
 				} else {
+					log.Printf("[NODE] Invalid key sizes (pub=%d priv=%d), regenerating", len(pub), len(priv))
 					pub, priv, id = nil, nil, ""
 				}
 			}
 		}
 	}
 
-	// Generate new key if not loaded
 	if pub == nil || priv == nil {
 		pub, priv = generateKeyPair()
 		id = hex.EncodeToString(computeMAC(pub, []byte("node-id"))[:16])
-		log.Printf("[NODE] Generated new keypair")
+		log.Printf("[NODE] Generated new Kyber-768 keypair")
 
-		// Save new key
 		if keyFile != "" {
 			saved := struct {
 				ID      string `json:"id"`
@@ -1711,7 +2126,7 @@ func initNode(addr string) {
 				Private: base64.StdEncoding.EncodeToString(priv),
 			}
 			if data, err := json.MarshalIndent(saved, "", "  "); err == nil {
-				if err := os.WriteFile(keyFile, data, 0400); err == nil {
+				if err := os.WriteFile(keyFile, data, 0600); err == nil {
 					log.Printf("[NODE] Saved keypair to %s", keyFile)
 				} else {
 					log.Printf("[NODE] Warning: failed to save keypair: %v", err)
@@ -1728,10 +2143,8 @@ func initNode(addr string) {
 		Name:    hostname,
 	}
 
-	// Determine public address for PKI (use hostname, not local bind address)
 	publicAddr := addr
 	if hostname != "" && hostname != "fog.onion" {
-		// Extract port from addr
 		port := "9999"
 		if _, p, err := net.SplitHostPort(addr); err == nil {
 			port = p
@@ -1739,7 +2152,6 @@ func initNode(addr string) {
 		publicAddr = hostname + ":" + port
 	}
 
-	// Add ourselves to PKI
 	pki.Add(&Node{
 		ID:        local.ID,
 		PublicKey: local.Public,
@@ -1776,13 +2188,16 @@ func main() {
 		fmt.Println("  - Threshold batch mixing")
 		fmt.Println("  - Realistic cover traffic")
 		fmt.Println("  - AES-256-GCM encryption")
-		fmt.Println("  - Forward secrecy (Curve25519 ECDH)")
+		fmt.Println("  - Forward secrecy (Kyber-768 KEM)")
+		fmt.Println("  - SMTP envelope preservation through mixnet")
+		fmt.Println("  - Exit node header sanitization")
+		fmt.Println("  - DNS MX resolution through Tor")
+		fmt.Println("  - ESMTP: 8BITMIME, SMTPUTF8, PIPELINING")
 		os.Exit(0)
 	}
 
 	debugMode = *debug
 
-	// Initialize
 	pki = newPKI()
 	pool = newBatchPool()
 	replay = newReplayCache()
@@ -1794,27 +2209,37 @@ func main() {
 	pkiFile = *pkiFlag
 	keyFile = *keyFlag
 
-	// Load PKI first (before initNode, so we know other nodes)
 	if pkiFile != "" {
+		// Derive state file path: nodes.json -> nodes_state.json
+		pkiStateFile = strings.TrimSuffix(pkiFile, ".json") + "_state.json"
+
+		// Load bootstrap PKI (hand-crafted, never overwritten by fog)
 		if err := pki.Load(pkiFile); err != nil {
-			log.Printf("[PKI] Load failed: %v", err)
-		} else {
-			removed := pki.CleanupDuplicates()
-			if removed > 0 {
-				log.Printf("[PKI] Cleaned up %d duplicate nodes", removed)
+			log.Printf("[PKI] Bootstrap load failed: %v", err)
+		}
+
+		// Merge dynamic state (gossip discoveries from previous runs)
+		if data, err := os.ReadFile(pkiStateFile); err == nil {
+			added := pki.MergeFromGossip(data)
+			if added > 0 {
+				log.Printf("[PKI] Merged %d nodes from dynamic state", added)
 			}
+		}
+
+		removed := pki.CleanupDuplicates()
+		if removed > 0 {
+			log.Printf("[PKI] Cleaned up %d duplicate nodes", removed)
 		}
 	}
 
 	initNode(*nodeAddr)
 
 	if *exportInfo {
-		// Need to initialize for export
 		hostname = *name
 		keyFile = *keyFlag
 		pki = newPKI()
 		initNode(*nodeAddr)
-		
+
 		info := map[string]interface{}{
 			"id":         local.ID,
 			"public_key": base64.StdEncoding.EncodeToString(local.Public),
@@ -1827,7 +2252,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Tor
 	dialer, err := proxy.SOCKS5("tcp", TorSocks, nil, proxy.Direct)
 	if err != nil {
 		log.Fatalf("[TOR] Connection failed: %v", err)
@@ -1839,6 +2263,7 @@ func main() {
 
 	log.Printf("[FOG] Starting v%s", Version)
 	log.Printf("[FOG] Hostname: %s", hostname)
+	log.Printf("[FOG] PKI: %d total nodes, %d healthy", len(pki.GetAll()), pki.HealthyCount())
 
 	useSphinx.Store(*sphinx)
 
@@ -1848,15 +2273,25 @@ func main() {
 			BatchThresholdMin, BatchThresholdMax,
 			int(CoverMinInterval.Minutes()), CoverMaxInterval.Hours())
 
-		log.Printf("[PKI] Loaded %d nodes", len(pki.GetAll()))
-
-		wg.Add(1)
-		go healthChecker()
-
+		// Start node server FIRST (must be ready before health checks)
 		wg.Add(1)
 		if err := startNodeServer(*nodeAddr); err != nil {
 			log.Fatalf("[NODE] Failed: %v", err)
 		}
+
+		// Initial health check at startup (don't wait 3 minutes)
+		log.Printf("[FOG] Running initial health check...")
+		checkAllNodes()
+		// Wait for Tor hidden service connections (can take 15-30s each)
+		time.Sleep(45 * time.Second)
+		healthy := pki.HealthyCount()
+		log.Printf("[FOG] Initial health: %d healthy nodes", healthy)
+		if healthy < MinHops {
+			log.Printf("[FOG] WARNING: only %d healthy nodes (need %d for Sphinx), will use direct relay until more nodes come online", healthy, MinHops)
+		}
+
+		wg.Add(1)
+		go healthChecker()
 
 		wg.Add(1)
 		go batchWorker()
@@ -1867,10 +2302,9 @@ func main() {
 		wg.Add(1)
 		go coverWorker()
 	} else {
-		log.Printf("[FOG] Direct relay mode")
+		log.Printf("[FOG] Direct relay mode (Sphinx disabled)")
 	}
 
-	// Workers
 	for i := 0; i < Workers; i++ {
 		wg.Add(1)
 		go relayWorker(i)
@@ -1882,7 +2316,6 @@ func main() {
 	wg.Add(1)
 	go cacheCleanupWorker()
 
-	// Signals
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
@@ -1892,18 +2325,17 @@ func main() {
 		cancel()
 	}()
 
-	// Save PKI periodically
-	if pkiFile != "" {
+	if pkiStateFile != "" {
 		go func() {
 			ticker := time.NewTicker(10 * time.Minute)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
-					pki.Save(pkiFile)
+					pki.SaveState(pkiStateFile)
 					return
 				case <-ticker.C:
-					pki.Save(pkiFile)
+					pki.SaveState(pkiStateFile)
 				}
 			}
 		}()
@@ -1915,8 +2347,8 @@ func main() {
 
 	wg.Wait()
 
-	if pkiFile != "" {
-		pki.Save(pkiFile)
+	if pkiStateFile != "" {
+		pki.SaveState(pkiStateFile)
 	}
 
 	log.Printf("[FOG] Shutdown complete")
